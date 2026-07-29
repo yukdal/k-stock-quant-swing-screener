@@ -24,6 +24,11 @@
             min-height: 700px; /* Let it expand naturally if content is longer */
         }
 
+        /* 카드가 4개 이상(미국판)이면 캔버스 자체를 넓혀 카드가 찌그러지지 않게 한다 */
+        body.wide {
+            width: 1640px;
+        }
+
         /* Beautiful Mesh Gradient + Glassmorphism Container */
         .widget-container {
             width: 100%;
@@ -100,6 +105,34 @@
         .card.kospi::before { background: linear-gradient(90deg, #3B82F6, #60A5FA); }
         .card.kosdaq::before { background: linear-gradient(90deg, #10B981, #34D399); }
         .card.sp500::before { background: linear-gradient(90deg, #8B5CF6, #A78BFA); }
+        .card.nasdaq100::before { background: linear-gradient(90deg, #0EA5E9, #38BDF8); }
+        .card.tqqq::before { background: linear-gradient(90deg, #F43F5E, #FB7185); }
+        .card.qld::before { background: linear-gradient(90deg, #F59E0B, #FBBF24); }
+
+        /* 카드가 4개 이상(미국판)일 때는 폭이 좁아지므로 여백과 글자 크기를 줄인다 */
+        .cards-container.dense { gap: 18px; }
+        .cards-container.dense .card { padding: 22px; }
+        .cards-container.dense .card-header { font-size: 19px; margin-bottom: 18px; }
+        .cards-container.dense .price { font-size: 36px; }
+        .cards-container.dense .change { font-size: 16px; padding: 5px 12px; }
+        .cards-container.dense .local-high { font-size: 13px; }
+        .cards-container.dense .comment-box { font-size: 13.5px; padding: 14px 16px; }
+        .cards-container.dense .watermark { font-size: 110px; }
+
+        /* 미국 종목 기준일(전일 종가) 배지 */
+        .as-of {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            margin-top: 10px;
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-size: 12.5px;
+            font-weight: 600;
+            color: #FCD34D;
+            background: rgba(251, 191, 36, 0.1);
+            border: 1px solid rgba(251, 191, 36, 0.18);
+        }
 
         .watermark {
             position: absolute;
@@ -121,6 +154,7 @@
             display: flex;
             align-items: center;
             gap: 8px;
+            white-space: nowrap;
         }
 
         .price-container {
@@ -146,6 +180,7 @@
             padding: 6px 14px;
             border-radius: 12px;
             display: inline-flex;
+            white-space: nowrap;
         }
 
         /* Pastel Soft Colors for friendly look */
@@ -174,6 +209,7 @@
             padding: 6px 12px;
             border-radius: 10px;
             border: 1px solid rgba(255, 255, 255, 0.05);
+            white-space: nowrap;
         }
 
         /* Speech Bubble Style Comment */
@@ -237,67 +273,35 @@
         }
     </style>
 </head>
-<body>
+<body class="{% if cards|length > 3 %}wide{% endif %}">
     <div class="widget-container">
         <div class="header">
-            <h1>✨ 오후 3시 45분 마감 증시 브리핑 (v4.2)</h1>
-            <p>{{ date_str }} 기준 · AI 기반 핵심 데이터 교차검증 완료</p>
+            <h1>{{ title }}</h1>
+            <p>{{ subtitle }}</p>
         </div>
 
-        <div class="cards-container">
-            <!-- KOSPI -->
-            <div class="card kospi">
-                <div class="watermark">🇰🇷</div>
-                <div class="card-header">🇰🇷 KOSPI</div>
+        <div class="cards-container {% if cards|length > 3 %}dense{% endif %}">
+            {% for c in cards %}
+            <div class="card {{ c.slug }}">
+                <div class="watermark">{{ c.flag }}</div>
+                <div class="card-header">{{ c.flag }} {{ c.name }}</div>
                 <div class="price-container">
-                    <div class="price">{{ kospi_close }}</div>
-                    <div class="change {{ kospi_color }}">
-                        {{ kospi_arrow }} {{ kospi_pt }}pt ({{ kospi_pct }})
+                    <div class="price">{{ c.close }}</div>
+                    <div class="change {{ c.color }}">
+                        {{ c.change }}
                     </div>
                     <div class="local-high">
-                        🎯 직전 고점 대비 <strong>{{ kospi_lh }}</strong>
+                        🎯 직전 고점 대비 <strong>{{ c.lh }}</strong>
                     </div>
+                    {% if c.as_of %}
+                    <div class="as-of">📅 {{ c.as_of }} 종가 기준</div>
+                    {% endif %}
                 </div>
                 <div class="comment-box">
-                    🤖 <strong>AI 진단:</strong><br>{{ kospi_comment }}
+                    🤖 <strong>AI 진단:</strong><br>{{ c.comment }}
                 </div>
             </div>
-
-            <!-- KOSDAQ -->
-            <div class="card kosdaq">
-                <div class="watermark">🇰🇷</div>
-                <div class="card-header">🇰🇷 KOSDAQ</div>
-                <div class="price-container">
-                    <div class="price">{{ kosdaq_close }}</div>
-                    <div class="change {{ kosdaq_color }}">
-                        {{ kosdaq_arrow }} {{ kosdaq_pt }}pt ({{ kosdaq_pct }})
-                    </div>
-                    <div class="local-high">
-                        🎯 직전 고점 대비 <strong>{{ kosdaq_lh }}</strong>
-                    </div>
-                </div>
-                <div class="comment-box">
-                    🤖 <strong>AI 진단:</strong><br>{{ kosdaq_comment }}
-                </div>
-            </div>
-
-            <!-- S&P 500 -->
-            <div class="card sp500">
-                <div class="watermark">🇺🇸</div>
-                <div class="card-header">🇺🇸 S&P 500</div>
-                <div class="price-container">
-                    <div class="price">{{ sp500_close }}</div>
-                    <div class="change {{ sp500_color }}">
-                        {{ sp500_arrow }} {{ sp500_pt }}pt ({{ sp500_pct }})
-                    </div>
-                    <div class="local-high">
-                        🎯 직전 고점 대비 <strong>{{ sp500_lh }}</strong>
-                    </div>
-                </div>
-                <div class="comment-box">
-                    🤖 <strong>AI 진단:</strong><br>{{ sp500_comment }}
-                </div>
-            </div>
+            {% endfor %}
         </div>
 
         <div class="macro-banner">

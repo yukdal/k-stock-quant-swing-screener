@@ -14,7 +14,13 @@ from quant_filter import run_quant_filtering
 from report_generator import generate_report
 from notifier import send_telegram_message, send_telegram_document
 from bot_listener import start_bot_listener
-from index_closing import execute_index_closing, check_and_send_crash_alerts, check_and_send_sidecar_alerts
+from index_closing import (
+    execute_index_closing,
+    check_and_send_crash_alerts,
+    check_and_send_sidecar_alerts,
+    check_and_send_leverage_etf_alerts,
+    is_us_market_open,
+)
 import psutil
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,9 +51,10 @@ def check_system_health():
             f"  - Database & Cache: {db_status}\n"
             f"  - Memory Usage: {mem_usage} / CPU: {cpu_usage}\n\n"
             "■ ⏳ 예정된 작업 일정 안내:\n"
-            "  - [15:45] 장 마감 정산 및 지수 인포그래픽 카드 발송 큐 대기 중\n"
+            "  - [15:45] 장 마감 정산 및 국내/미국 지수 인포그래픽 카드 2종 발송 큐 대기 중\n"
             "  - [21:00] 당일 스윙/수급 포착 종목 심층 분석 리포트 발송 큐 대기 중\n"
-            "  - [실시간] 지수 전고점 대비 변동성 리스크 스크리너 활성화 중\n\n"
+            "  - [실시간] 지수 전고점 대비 변동성 리스크 스크리너 활성화 중\n"
+            "  - [미국장중] TQQQ/QLD 전고점 대비 분할매수 스크리너 30분 주기 감시 중\n\n"
             "■ 🚨 에러 및 예외 발생 점검 결과:\n"
             "  - 특이사항 없음. 시스템 내부에서 감지된 런타임 에러 0건 (SAFE)\n\n"
             "💡 본 보고서는 무인 자동화 파이프라인에 의해 정기적으로 생성되었습니다."
@@ -280,6 +287,7 @@ def main():
         print("🕰️ Starting daily robust scheduler mode (Production Server)...")
         print("📅 Index Settlement is scheduled to run every Mon-Fri at 15:45 KST.")
         print("📅 NXT Screener is scheduled to run every Mon-Fri at 21:00 KST.")
+        print("📅 Leverage ETF (TQQQ/QLD) monitor runs every 30 min during US regular hours (09:30-16:00 ET).")
         send_telegram_message("🚀 [시스템 알림] 스윙종목 분석 봇이 서버에서 정상 작동을 시작했습니다. (스케줄러 대기 중)")
         start_bot_listener(screener_callback=screener_nxt_wrapper, index_callback=execute_index_closing)
     
@@ -330,6 +338,7 @@ def main():
     last_crash_check = None
     last_run_health = None
     last_sidecar_check_time = 0
+    last_us_check_time = 0
     
     # Catch-up logic on startup
     now_kst = datetime.datetime.now(kst_tz)
@@ -370,7 +379,16 @@ def main():
                 if current_timestamp - last_sidecar_check_time >= 90:
                     run_threaded(check_and_send_sidecar_alerts)
                     last_sidecar_check_time = current_timestamp
-            
+
+            # 미국 정규장 중 30분 단위 레버리지 ETF(TQQQ/QLD) 분할매수 감시.
+            # 개장 판정은 KST 고정 시각이 아닌 미국 동부(ET) 기준이므로 서머타임에 자동 대응한다.
+            if is_us_market_open():
+                current_timestamp = time.time()
+                if current_timestamp - last_us_check_time >= 1800:
+                    print("⏰ Triggering US Leverage ETF (TQQQ/QLD) monitor...")
+                    run_threaded(check_and_send_leverage_etf_alerts)
+                    last_us_check_time = current_timestamp
+
             # 06:00, 12:00 KST: System Health Check
             if current_time in ["06:00", "12:00"] and last_run_health != current_time:
                 print(f"⏰ Triggering {current_time} KST System Health Check...")

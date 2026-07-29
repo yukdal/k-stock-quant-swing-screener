@@ -1,14 +1,34 @@
 import datetime
+from zoneinfo import ZoneInfo
 import yfinance as yf
 from google import genai
 from config import GEMINI_API_KEY, GEMINI_MODEL
 from notifier import send_telegram_message
 
+# 종목 메타데이터
+#   market : "KR"(실시간 4중 폴백 조회) / "US"(yfinance 종가 조회)
+#   unit   : "pt"(지수, 포인트 표기) / "usd"(ETF, 달러 표기)
+#   slug   : 인포그래픽 템플릿의 CSS 클래스 및 변수 접두어
 INDICES = {
-    "KOSPI": "^KS11",
-    "KOSDAQ": "^KQ11",
-    "S&P 500": "^GSPC"
+    "KOSPI":      {"ticker": "^KS11", "market": "KR", "unit": "pt",  "flag": "🇰🇷", "slug": "kospi"},
+    "KOSDAQ":     {"ticker": "^KQ11", "market": "KR", "unit": "pt",  "flag": "🇰🇷", "slug": "kosdaq"},
+    "S&P 500":    {"ticker": "^GSPC", "market": "US", "unit": "pt",  "flag": "🇺🇸", "slug": "sp500"},
+    "NASDAQ 100": {"ticker": "^NDX",  "market": "US", "unit": "pt",  "flag": "🇺🇸", "slug": "nasdaq100"},
+    "TQQQ":       {"ticker": "TQQQ",  "market": "US", "unit": "usd", "flag": "🇺🇸", "slug": "tqqq"},
+    "QLD":        {"ticker": "QLD",   "market": "US", "unit": "usd", "flag": "🇺🇸", "slug": "qld"},
 }
+
+# 레버리지 ETF 분할매수 알림 기준 (전고점 대비 낙폭 %)
+#   TQQQ : -10%에서 1차 매수, 이후 1%마다 (-11% 2차, -12% 3차 ...)
+#   QLD  : -10%에서 1차 매수, 이후 5%마다 (-15% 2차, -20% 3차 ...)
+LEVERAGE_ETF_RULES = {
+    "TQQQ": {"start": 10, "step": 1},
+    "QLD":  {"start": 10, "step": 5},
+}
+
+US_EASTERN = ZoneInfo("America/New_York")
+US_MARKET_OPEN = datetime.time(9, 30)
+US_MARKET_CLOSE = datetime.time(16, 0)
 
 CRASH_STATE = {
     "date": None,
@@ -21,6 +41,61 @@ SIDECAR_STATE = {
     "KOSPI": False,
     "KOSDAQ": False
 }
+
+# 레버리지 ETF 알림 상태. 미국장은 KST 자정을 넘겨 이어지므로
+# KST 날짜가 아닌 '미국 동부(ET) 날짜' 기준으로 초기화해야 장 도중 리셋되지 않는다.
+ETF_ALERT_STATE = {
+    "session": None,
+    "TQQQ": 0,
+    "QLD": 0,
+}
+
+
+def get_index_meta(name):
+    """종목 메타데이터 조회. 미등록 종목도 안전하게 기본값을 돌려준다."""
+    meta = INDICES.get(name)
+    if meta:
+        return meta
+    return {
+        "ticker": None,
+        "market": "KR" if name in ("KOSPI", "KOSDAQ") else "US",
+        "unit": "pt",
+        "flag": "",
+        "slug": name.lower().replace("&", "").replace(" ", ""),
+    }
+
+
+def get_us_session_date():
+    """미국 동부시간 기준 오늘 날짜 (거래 세션 식별자)"""
+    return datetime.datetime.now(US_EASTERN).date()
+
+
+def is_us_market_open(now_et=None):
+    """
+    미국 정규장 개장 여부. 서머타임(EDT/EST)은 ZoneInfo가 자동 처리하므로
+    KST 고정 시각(23:30~06:00)이 아닌 ET 기준으로 판정한다.
+    주말 판정도 KST가 아닌 ET 날짜 기준이어야 한다 (금요일 밤 미국장 = KST 토요일 새벽).
+    """
+    now_et = now_et or datetime.datetime.now(US_EASTERN)
+    if now_et.weekday() >= 5:
+        return False
+    return US_MARKET_OPEN <= now_et.time() <= US_MARKET_CLOSE
+
+
+def find_recent_swing_high(highs_series):
+    """앞뒤 15일(약 3주) 윈도우에서 가장 높은 가격을 '직전 전고점'으로 정의"""
+    prices = highs_series.values
+    n = len(prices)
+    if n < 2:
+        return highs_series.max()
+
+    window = 15
+    for i in range(n - 1, -1, -1):
+        start = max(0, i - window)
+        end = min(n, i + window + 1)
+        if prices[i] == max(prices[start:end]):
+            return prices[i]
+    return prices.max()
 
 def fetch_realtime_index_multi_api(name):
     """
@@ -67,28 +142,26 @@ def fetch_realtime_index_multi_api(name):
         print(f"❌ Naver Finance Index fallback failed for {name}: {e}")
         return None
 
-def fetch_index_data(name, ticker):
+def fetch_index_data(name, ticker=None):
     """
-    특정 지수의 당일/전일 종가 및 직전 전고점(Swing High)을 계산합니다.
+    특정 지수/ETF의 당일(또는 미국 전일) 종가 및 직전 전고점(Swing High) 대비 낙폭을 계산합니다.
+    ticker를 생략하면 INDICES 메타데이터에서 자동으로 조회합니다.
     """
-    def find_recent_swing_high(highs_series):
-        prices = highs_series.values
-        n = len(prices)
-        if n < 2: return highs_series.max()
-            
-        window = 15 # 15일(약 3주) 기준 앞뒤로 가장 높은 가격을 '전고점'으로 정의
-        for i in range(n-1, -1, -1):
-            start = max(0, i - window)
-            end = min(n, i + window + 1)
-            if prices[i] == max(prices[start:end]):
-                return prices[i]
-        return prices.max()
-        
+    meta = get_index_meta(name)
+    ticker = ticker or meta["ticker"]
+    if not ticker:
+        print(f"❌ No ticker registered for {name}.")
+        return None
+
+    market = meta["market"]
+    unit = meta["unit"]
+
     try:
         idx = yf.Ticker(ticker)
         max_df = idx.history(period="5y") # 52주 제한 없이 넉넉하게 5년치에서 최근 고점 탐색
-        
-        if name in ["KOSPI", "KOSDAQ"]:
+        as_of = None
+
+        if market == "KR":
             realtime_data = fetch_realtime_index_multi_api(name)
             if not realtime_data:
                 raise Exception(f"All APIs failed to fetch {name} real-time data.")
@@ -96,7 +169,8 @@ def fetch_index_data(name, ticker):
             point_change = realtime_data['point_change']
             pct_change = realtime_data['pct_change']
         else:
-            # S&P 500 uses yfinance (US market already closed)
+            # 미국 종목(S&P 500 / NASDAQ 100 / TQQQ / QLD)은 yfinance 종가를 사용한다.
+            # KST 15:45 시점에는 미국장이 이미 마감된 상태이므로 '전일(미국 현지) 종가'가 잡힌다.
             recent_df = idx.history(period="5d").dropna(subset=['Close'])
             if len(recent_df) < 2:
                 return None
@@ -104,24 +178,93 @@ def fetch_index_data(name, ticker):
             prev_close = recent_df['Close'].iloc[-2]
             point_change = current_close - prev_close
             pct_change = (point_change / prev_close) * 100 if prev_close > 0 else 0.0
-            
+            try:
+                as_of = recent_df.index[-1].date()
+            except Exception:
+                as_of = None
+
         # 최대 기간 데이터로 최근 스윙 하이(전고점) 분석
         if len(max_df) > 0:
             max_df = max_df.dropna(subset=['High'])
             local_high = find_recent_swing_high(max_df['High']) # 52주 제한 없는 진짜 직전 전고점
-            
+
             local_high_pct = ((current_close - local_high) / local_high * 100) if local_high > 0 else 0.0
         else:
             local_high_pct = 0.0
-            
+
         return {
             "current_close": current_close,
             "point_change": point_change,
             "pct_change": pct_change,
-            "local_high_pct": local_high_pct
+            "local_high_pct": local_high_pct,
+            "unit": unit,
+            "market": market,
+            "as_of": as_of
         }
     except Exception as e:
         print(f"❌ Error fetching index data for {name} ({ticker}): {e}")
+        return None
+
+
+def fetch_us_realtime_quote(name):
+    """
+    미국 장중 실시간 시세 조회 (yfinance fast_info → 1분봉 폴백).
+    전고점은 fetch_index_data와 동일하게 5년 일봉 스윙하이 기준으로 계산합니다.
+    """
+    meta = get_index_meta(name)
+    ticker = meta["ticker"]
+    if not ticker:
+        return None
+
+    try:
+        t = yf.Ticker(ticker)
+        price = None
+        prev_close = None
+
+        # 1. fast_info (실시간 최종 체결가)
+        try:
+            fi = t.fast_info
+            price = float(fi["last_price"])
+            prev_close = float(fi["previous_close"])
+        except Exception as e:
+            print(f"⚠️ fast_info unavailable for {name}: {e}")
+
+        # 2. 1분봉 폴백
+        if not price:
+            intraday = t.history(period="1d", interval="1m").dropna(subset=['Close'])
+            if len(intraday) > 0:
+                price = float(intraday['Close'].iloc[-1])
+
+        if not prev_close:
+            daily = t.history(period="5d").dropna(subset=['Close'])
+            if len(daily) >= 2:
+                prev_close = float(daily['Close'].iloc[-2])
+
+        if not price:
+            print(f"❌ Failed to fetch real-time quote for {name} ({ticker}).")
+            return None
+
+        point_change = (price - prev_close) if prev_close else 0.0
+        pct_change = (point_change / prev_close * 100) if prev_close else 0.0
+
+        max_df = t.history(period="5y").dropna(subset=['High'])
+        if len(max_df) > 0:
+            local_high = find_recent_swing_high(max_df['High'])
+            local_high_pct = ((price - local_high) / local_high * 100) if local_high > 0 else 0.0
+        else:
+            local_high_pct = 0.0
+
+        return {
+            "current_close": price,
+            "point_change": point_change,
+            "pct_change": pct_change,
+            "local_high_pct": local_high_pct,
+            "unit": meta["unit"],
+            "market": "US",
+            "as_of": None
+        }
+    except Exception as e:
+        print(f"❌ Error fetching US real-time quote for {name}: {e}")
         return None
 
 def generate_index_macro_comment():
@@ -134,7 +277,12 @@ def generate_index_macro_comment():
     for attempt in range(max_retries):
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
-            prompt = "당신은 20년 경력의 증권사 수석 매크로 애널리스트입니다. 오늘 한국(KOSPI/KOSDAQ) 및 미국 시장 마감 직후의 시장 국면과 변동성에 대한 핵심 통찰을 딱 1줄의 숏 코멘트로 요약해서 작성해주세요."
+            prompt = (
+                "당신은 20년 경력의 증권사 수석 매크로 애널리스트입니다. "
+                "오늘 한국(KOSPI/KOSDAQ)과 미국(S&P 500/NASDAQ 100) 시장 마감 직후의 시장 국면, "
+                "그리고 나스닥 레버리지 ETF(TQQQ/QLD)의 변동성 리스크에 대한 핵심 통찰을 "
+                "딱 1줄의 숏 코멘트로 요약해서 작성해주세요."
+            )
             response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             return response.text.strip()
         except Exception as e:
@@ -150,15 +298,39 @@ def generate_index_macro_comment():
 def format_number(val, is_pct=False):
     """지수 소수점 및 기호 포맷팅"""
     if val is None: return "N/A"
-    
+
     # 등락률, 포인트 모두 소수점 둘째자리 통일 적용
     sign = "▲" if val > 0 else ("▼" if val < 0 else "")
     plus = "+" if val > 0 else ""
-    
+
     if is_pct:
         return f"{plus}{val:.2f}%"
     else:
         return f"{sign}{abs(val):.2f}"
+
+
+def format_price(val, unit="pt"):
+    """종가 표기. ETF(usd)는 달러 기호를 붙인다."""
+    if val is None: return "N/A"
+    return f"${val:,.2f}" if unit == "usd" else f"{val:,.2f}"
+
+
+def format_change_block(data):
+    """
+    전일대비 등락 표기.
+      지수(pt) : '▲12.34pt, +0.45%'
+      ETF(usd) : '▲$1.20, +1.32%'
+    """
+    unit = data.get("unit", "pt")
+    pt = data["point_change"]
+    sign = "▲" if pt > 0 else ("▼" if pt < 0 else "")
+
+    if unit == "usd":
+        change = f"{sign}${abs(pt):.2f}"
+    else:
+        change = f"{sign}{abs(pt):.2f}pt"
+
+    return f"{change}, {format_number(data['pct_change'], is_pct=True)}"
 
 def execute_index_closing(*args, **kwargs):
     """오후 3시 45분에 단독 실행되는 메인 파이프라인"""
@@ -170,28 +342,50 @@ def execute_index_closing(*args, **kwargs):
     print(f"\n📈 [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting Index Closing Settlement...")
     
     try:
-        report_lines = []
-        report_lines.append("📊 [오후 3시 45분 국내외 주요 지수 마감 정산 (v4.1)]")
-        report_lines.append("오늘 정규장 마감 직후 집계된 주요 지수의 위치와 변동성 데이터입니다. (데이터 교차검증 완료)\n")
-        
-        report_lines.append("| 지수명 | 당일 종가 (전일대비) | 직전 전고점 대비 |")
-        report_lines.append("| :--- | :--- | :---: |")
-        
+        # 1. 전 종목 데이터 수집
         indices_data = {}
-        for name, ticker in INDICES.items():
-            data = fetch_index_data(name, ticker)
-            indices_data[name] = data
-            if data:
-                c_close = f"{data['current_close']:,.2f}"
-                pt_chg = format_number(data['point_change'], is_pct=False)
-                pct_chg = format_number(data['pct_change'], is_pct=True)
-                
-                lh_chg = format_number(data['local_high_pct'], is_pct=True)
-                
-                report_lines.append(f"| **{name}** | {c_close} ({pt_chg}pt, {pct_chg}) | {lh_chg} |")
-            else:
-                report_lines.append(f"| **{name}** | 데이터 수집 지연 | - |")
-                
+        for name, meta in INDICES.items():
+            indices_data[name] = fetch_index_data(name, meta["ticker"])
+
+        def build_table(names, close_header):
+            """국내/미국 섹션별 마크다운 표 생성"""
+            lines = [
+                f"| 종목명 | {close_header} | 직전 전고점 대비 |",
+                "| :--- | :--- | :---: |"
+            ]
+            for name in names:
+                data = indices_data.get(name)
+                if data:
+                    c_close = format_price(data['current_close'], data.get('unit', 'pt'))
+                    change = format_change_block(data)
+                    lh_chg = format_number(data['local_high_pct'], is_pct=True)
+                    lines.append(f"| **{name}** | {c_close} ({change}) | {lh_chg} |")
+                else:
+                    lines.append(f"| **{name}** | 데이터 수집 지연 | - |")
+            return lines
+
+        kr_names = [n for n, m in INDICES.items() if m["market"] == "KR"]
+        us_names = [n for n, m in INDICES.items() if m["market"] == "US"]
+
+        # 미국 데이터의 실제 기준일(전일 종가) 표기
+        us_as_of = next(
+            (indices_data[n]['as_of'] for n in us_names
+             if indices_data.get(n) and indices_data[n].get('as_of')),
+            None
+        )
+        us_as_of_str = f"{us_as_of.month}/{us_as_of.day} 종가 기준" if us_as_of else "직전 거래일 종가 기준"
+
+        report_lines = []
+        report_lines.append("📊 [오후 3시 45분 국내외 주요 지수 마감 정산 (v5.0)]")
+        report_lines.append("오늘 정규장 마감 직후 집계된 주요 지수의 위치와 변동성 데이터입니다. (데이터 교차검증 완료)\n")
+
+        report_lines.append("🇰🇷 **국내 지수**")
+        report_lines.extend(build_table(kr_names, "당일 종가 (전일대비)"))
+
+        report_lines.append(f"\n🇺🇸 **미국 지수 · ETF** ({us_as_of_str})")
+        report_lines.append("_미국장은 한국시간 새벽에 마감되므로 직전 거래일 종가입니다._")
+        report_lines.extend(build_table(us_names, "종가 (전일대비)"))
+
         comment = generate_index_macro_comment()
         report_lines.append("\n💡 **매크로 한줄평 (Gemini Pro 분석)**")
         report_lines.append(f"- {comment}")
@@ -223,10 +417,10 @@ def check_and_send_crash_alerts():
 
     print(f"🔍 [{datetime.datetime.now().strftime('%H:%M:%S')}] Checking Index Crash Alerts...")
     
-    for name, ticker in [("KOSPI", INDICES["KOSPI"]), ("KOSDAQ", INDICES["KOSDAQ"])]:
-        data = fetch_index_data(name, ticker)
+    for name in ["KOSPI", "KOSDAQ"]:
+        data = fetch_index_data(name, INDICES[name]["ticker"])
         if not data: continue
-        
+
         lh_pct = data["local_high_pct"]
         if lh_pct > 0: continue # 상승 구간이면 무시
         
@@ -310,11 +504,11 @@ def check_and_send_sidecar_alerts():
 
     print(f"🔍 [{datetime.datetime.now().strftime('%H:%M:%S')}] Checking Sidecar Alerts...")
     
-    for name, ticker in [("KOSPI", INDICES["KOSPI"]), ("KOSDAQ", INDICES["KOSDAQ"])]:
+    for name in ["KOSPI", "KOSDAQ"]:
         if SIDECAR_STATE[name]:
             continue # 당일 이미 발동되었으면 스킵
-            
-        data = fetch_index_data(name, ticker)
+
+        data = fetch_index_data(name, INDICES[name]["ticker"])
         if not data: continue
         
         pct_change = data["pct_change"]
@@ -334,6 +528,77 @@ def check_and_send_sidecar_alerts():
             
             send_telegram_message(msg)
             print(f"🚨 Sidecar alert sent for {name}: {pct_change}%")
+
+def calc_etf_buy_tier(drop_pct, start, step):
+    """
+    전고점 대비 낙폭(양수 %)에 해당하는 분할매수 단계와 기준 낙폭을 반환합니다.
+    기준 미달이면 (0, 0).
+
+    예) TQQQ(start=10, step=1): 10.0% → (1차, 10), 11.5% → (2차, 11), 12.0% → (3차, 12)
+        QLD (start=10, step=5): 10.0% → (1차, 10), 15.2% → (2차, 15), 20.0% → (3차, 20)
+    """
+    if drop_pct < start:
+        return 0, 0
+    level = start + int((drop_pct - start) // step) * step
+    tier = int((level - start) // step) + 1
+    return tier, level
+
+
+def check_and_send_leverage_etf_alerts():
+    """
+    미국 정규장 중 30분 단위로 TQQQ/QLD의 전고점 대비 낙폭을 체크하여
+    분할매수 단계 진입 시 알림을 발송합니다.
+    """
+    global ETF_ALERT_STATE
+
+    if not is_us_market_open():
+        return
+
+    session = get_us_session_date()
+    if ETF_ALERT_STATE["session"] != session:
+        ETF_ALERT_STATE["session"] = session
+        for etf_name in LEVERAGE_ETF_RULES:
+            ETF_ALERT_STATE[etf_name] = 0
+
+    now_et = datetime.datetime.now(US_EASTERN)
+    print(f"🔍 [{now_et.strftime('%H:%M:%S')} ET] Checking Leverage ETF Buy Alerts...")
+
+    for name, rule in LEVERAGE_ETF_RULES.items():
+        quote = fetch_us_realtime_quote(name)
+        if not quote: continue
+
+        lh_pct = quote["local_high_pct"]
+
+        # 전고점 회복 구간이면 상태를 초기화해, 다시 하락 돌파할 때 알림이 울리도록 한다.
+        if lh_pct >= 0:
+            ETF_ALERT_STATE[name] = 0
+            continue
+
+        drop_pct = abs(lh_pct)
+        tier, level = calc_etf_buy_tier(drop_pct, rule["start"], rule["step"])
+
+        prev_level = ETF_ALERT_STATE[name]
+        ETF_ALERT_STATE[name] = level
+
+        if tier <= 0 or level <= prev_level:
+            continue
+
+        price_str = format_price(quote['current_close'], quote.get('unit', 'usd'))
+        change_str = format_change_block(quote)
+        actual_drop = f"{lh_pct:.2f}"
+        kst_time = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime('%m/%d %H:%M')
+
+        msg = f"🚨 {name} 전고점 대비 -{level}% 돌파! <b>[{tier}차 매수 추천]</b> 🚨\n\n"
+        msg += f"나스닥100 레버리지 ETF {name}가 직전 전고점 대비 하락 구간에 진입했습니다.\n"
+        msg += f"■ 현재가: {price_str} ({change_str})\n"
+        msg += f"<b>■ 전고점 대비 하락률: {actual_drop}%</b>\n"
+        msg += f"■ 감지 시각: {kst_time} KST (미국 정규장 중)\n\n"
+        msg += f"※ 매수 기준: -{rule['start']}% 1차 진입 후 {rule['step']}% 하락마다 추가 매수\n"
+        msg += "레버리지 ETF는 변동성 잠식 리스크가 있으므로 룰 베이스 분할 매수 원칙을 지켜 대응하시기 바랍니다."
+
+        send_telegram_message(msg, parse_mode="HTML")
+        print(f"🚨 Leverage ETF buy alert sent for {name}: -{level}% ({tier}차)")
+
 
 if __name__ == "__main__":
     execute_index_closing()
