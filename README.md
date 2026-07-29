@@ -90,6 +90,7 @@
 | 임포트 검증 | 주요 모듈 임포트 (순환 임포트·오타 조기 발견) |
 | 알림 로직 테스트 | `test_leverage_alerts.py` — 티어 계산, 중복 발송 방지, ET 기준 개장 판정 |
 | 렌더링 테스트 | `test_report_render.py` — 메타데이터 정합성, 숫자 포맷, 텍스트 리포트, Jinja 템플릿 |
+| 토큰 캐시 테스트 | `test_kis_token_cache.py` — 캐시 손상 시 자동 재발급 복구 |
 
 로컬에서도 동일하게 실행할 수 있습니다.
 
@@ -325,6 +326,7 @@ GitHub `main` 브랜치에 새 커밋이 올라오면 **OCI 서버가 3분 이�
 
 *   `test_leverage_alerts.py`: TQQQ/QLD 분할매수 티어 계산, 중복 발송 방지, 미국장 개장 판정 검증. **CI 자동 실행.**
 *   `test_report_render.py`: 종목 메타데이터, 숫자 포맷, 15:45 리포트, 인포그래픽 렌더링 검증. **CI 자동 실행.**
+*   `test_kis_token_cache.py`: KIS 토큰 캐시가 깨졌을 때 자동 재발급으로 복구되는지 검증. **CI 자동 실행.**
 *   `test_sidecar.py`: 사이드카 알림 수동 점검용 (목업 데이터로 실제 텔레그램 발송).
 *   `test_alert.py`: 급락 경보 메시지 서식 수동 점검용 (실제 텔레그램 발송).
 

@@ -49,3 +49,7 @@ jobs:
       - name: 리포트 및 인포그래픽 렌더링 테스트
         # 15:45 텍스트 리포트 조립, 카드 컨텍스트, Jinja 템플릿 렌더링
         run: python test_report_render.py
+
+      - name: KIS 토큰 캐시 복구 테스트
+        # 캐시 파일이 깨졌을 때 재발급으로 자동 복구되는지 검증
+        run: python test_kis_token_cache.py
