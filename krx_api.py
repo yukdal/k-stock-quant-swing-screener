@@ -80,6 +80,47 @@ def fetch_krx_investor_trend(ticker):
         return None                                                      # 실패해도 봇이 멈추지 않도록 None 반환
 
 
+# KRX 지수 코드 (get_index_ohlcv 조회용)
+KRX_INDEX_CODES = {
+    "KOSPI": "1001",
+    "KOSDAQ": "2001",
+}
+
+
+def fetch_krx_index_ohlcv(market_type="KOSPI", days=1825):
+    """
+    KRX에서 지수(KOSPI/KOSDAQ)의 일봉 OHLCV를 DataFrame으로 조회합니다.
+    전고점(스윙 하이) 계산용이므로 기본 5년치(1825일)를 가져옵니다.
+
+    pykrx는 KRX 로그인 세션이 없으면 일반 요청으로 조회를 시도하므로
+    (website/comm/webio.py 참고) KRX_ID/KRX_PW 없이도 동작할 수 있습니다.
+    조회에 실패하면 None을 반환하여 호출부가 다른 소스로 폴백하게 합니다.
+
+    반환: '고가', '종가' 등의 컬럼을 가진 DataFrame (날짜 오름차순) 또는 None
+    """
+    try:
+        index_code = KRX_INDEX_CODES.get(market_type.upper())
+        if not index_code:
+            print(f"⚠️ KRX 지수 코드가 등록되지 않은 종목입니다: {market_type}")
+            return None
+
+        today = datetime.date.today()
+        start = (today - datetime.timedelta(days=days)).strftime("%Y%m%d")
+        end = today.strftime("%Y%m%d")
+
+        df = stock.get_index_ohlcv(start, end, index_code)
+
+        if df is None or df.empty:
+            print(f"⚠️ KRX index OHLCV empty for {market_type}.")
+            return None
+
+        return df
+    except Exception as e:
+        # KRX 접속 실패/로그인 요구 등 어떤 예외가 나도 호출부가 폴백할 수 있게 None 반환
+        print(f"⚠️ KRX index OHLCV unavailable for {market_type}: {e}")
+        return None
+
+
 def get_krx_current_index(market_type="KOSPI"):
     """
     KRX에서 지수(KOSPI/KOSDAQ)의 최근 종가와 전일 대비 등락을 계산해서 반환합니다.

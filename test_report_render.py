@@ -71,7 +71,62 @@ check("ETF 하락 등락 포맷", ic.format_change_block(MOCK["QLD"]) == "▼$0.
 
 print()
 print("=" * 60)
-print("3. 15:45 텍스트 리포트 생성")
+print("3. 국내 지수 전고점 데이터 소스 (KRX 우선 / yfinance 폴백)")
+print("=" * 60)
+
+import pandas as pd
+import krx_api
+
+_yf_calls = []
+
+
+class _FakeTicker:
+    """yfinance 호출 여부를 감시하기 위한 목업"""
+    def __init__(self, ticker):
+        _yf_calls.append(ticker)
+
+    def history(self, period=None, interval=None):
+        return pd.DataFrame({"High": [100.0, 110.0, 105.0], "Close": [99.0, 109.0, 104.0]})
+
+
+ic.yf.Ticker = _FakeTicker
+
+# (1) KRX가 정상일 때 → yfinance를 호출하지 않아야 한다
+_yf_calls.clear()
+krx_api.fetch_krx_index_ohlcv = lambda market_type, days=None: pd.DataFrame(
+    {"고가": [2500.0, 2600.0, 2550.0], "종가": [2490.0, 2590.0, 2540.0]}
+)
+series = ic.fetch_kr_index_high_series("KOSPI", "^KS11")
+check("KRX 성공 시 시리즈 반환", series is not None and len(series) == 3)
+check("KRX 성공 시 yfinance 미호출", len(_yf_calls) == 0, f"호출 {_yf_calls}")
+check("KRX 데이터로 전고점 계산", ic.find_recent_swing_high(series) == 2600.0,
+      str(ic.find_recent_swing_high(series)) if series is not None else "None")
+
+# (2) KRX가 실패할 때 → yfinance로 폴백해야 한다
+_yf_calls.clear()
+krx_api.fetch_krx_index_ohlcv = lambda market_type, days=None: None
+series = ic.fetch_kr_index_high_series("KOSPI", "^KS11")
+check("KRX 실패 시 yfinance 폴백", len(_yf_calls) == 1, f"호출 {_yf_calls}")
+check("폴백 시리즈 반환", series is not None and len(series) == 3)
+
+# (3) KRX가 예외를 던져도 폴백해야 한다
+_yf_calls.clear()
+def _raise(*a, **k):
+    raise RuntimeError("KRX 접속 실패 (테스트)")
+krx_api.fetch_krx_index_ohlcv = _raise
+series = ic.fetch_kr_index_high_series("KOSDAQ", "^KQ11")
+check("KRX 예외 시에도 폴백", len(_yf_calls) == 1 and series is not None)
+
+# (4) 미국 종목은 KRX를 거치지 않고 yfinance만 사용 (fetch_index_data 경로)
+_yf_calls.clear()
+krx_api.fetch_krx_index_ohlcv = lambda market_type, days=None: pd.DataFrame({"고가": [1.0, 2.0]})
+us_data = ic.fetch_index_data("TQQQ")
+check("미국 종목은 yfinance 사용", len(_yf_calls) >= 1, f"호출 {_yf_calls}")
+check("미국 종목 데이터 반환", us_data is not None and us_data["market"] == "US")
+
+print()
+print("=" * 60)
+print("4. 15:45 텍스트 리포트 생성")
 print("=" * 60)
 
 sent = []
@@ -96,7 +151,7 @@ check("매크로 한줄평 포함", "테스트용 매크로 한줄평입니다."
 
 print()
 print("=" * 60)
-print("4. 인포그래픽 카드 컨텍스트 및 템플릿 렌더링")
+print("5. 인포그래픽 카드 컨텍스트 및 템플릿 렌더링")
 print("=" * 60)
 
 env = Environment(loader=FileSystemLoader("templates"))
