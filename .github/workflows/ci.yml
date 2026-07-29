@@ -34,10 +34,7 @@ jobs:
         # CI 테스트는 Jinja 렌더링까지만 검증하고 스크린샷은 찍지 않습니다.
 
       - name: 전체 파일 문법 검사
-        # temp_index_closing.py는 index_closing.py의 옛 복사본으로 어디서도 임포트되지
-        # 않으며, UTF-16으로 저장되어 있어 컴파일이 불가능하므로 검사에서 제외합니다.
-        # (정리하려면 파일을 삭제하고 아래 -x 옵션을 지우면 됩니다)
-        run: python -m compileall -q -x 'temp_index_closing\.py' .
+        run: python -m compileall -q .
 
       - name: 모듈 임포트 검증
         # 순환 임포트나 오타를 조기에 잡습니다. 임포트만으로 네트워크 호출이

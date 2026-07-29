@@ -207,7 +207,7 @@ python -m playwright install chromium
 #### A. ⏰ 자동 스케줄러 모드 (추천)
 컴퓨터나 서버를 켜두면 매일 정해진 시간에 스스로 알아서 동작합니다.
 ```bash
-python main.py
+python swing_main.py
 ```
 - **오후 3시 45분**: 자동으로 지수 마감 인포그래픽을 텔레그램으로 보냅니다.
 - **오후 9시 00분**: 스윙 종목 분석 리포트와 분석 원본 엑셀(CSV) 파일을 텔레그램으로 보냅니다.
@@ -216,11 +216,11 @@ python main.py
 기다리지 않고 지금 당장 결과물을 받아보고 싶을 때 사용합니다.
 - **스윙 종목 분석 당장 실행하기**:
   ```bash
-  python main.py --now
+  python swing_main.py --now
   ```
 - **마감 지수 인포그래픽 당장 실행하기**:
   ```bash
-  python main.py --now-index
+  python swing_main.py --now-index
   ```
 
 ---
@@ -263,16 +263,27 @@ GitHub `main` 브랜치에 새 커밋이 올라오면 **OCI 서버가 3분 이�
 
 ## 📁 7. 프로젝트 구조
 
-*   `main.py`: 파이프라인 진입점 (스케줄러 및 CLI 모드 제어).
+*   `swing_main.py`: 파이프라인 진입점 (스케줄러, 실시간 감시 루프, CLI 모드 제어).
 *   `config.py`: 환경 변수 로드 및 설정 검증.
 *   `scraper.py`: DART, 네이버, 구글 뉴스 등 웹 및 API 스크래핑 엔진.
 *   `quant_filter.py`: 1차 수치/이평선 필터 및 DART 재무 필터 실행부.
 *   `index_closing.py`: 15:45 마감 시황 지수/ETF 분석, 매크로 한줄평 생성, 급락·사이드카·레버리지 ETF 알림 로직.
 *   `infographic_generator.py`: Playwright 및 HTML 템플릿 기반 인포그래픽 이미지 렌더링 (국내/미국 2장 분리 발송).
 *   `templates/infographic_widget.html`: 인포그래픽 카드 템플릿. 카드는 `cards` 목록을 순회해 생성되므로 종목 추가 시 수정 불필요.
-*   `test_leverage_alerts.py`: TQQQ/QLD 분할매수 알림 티어 계산 및 중복 발송 방지 검증 스크립트.
 *   `report_generator.py`: Gemini API 연동 및 로컬 분석 보고서 컴파일.
 *   `notifier.py`: 텔레그램 메시지 포맷팅 및 분할 발송 로직.
+*   `chat_manager.py`: 텔레그램 수신 대상 채팅방 ID 관리.
+*   `bot_listener.py`: 텔레그램 챗봇 명령 수신 리스너.
+*   `kis_api.py` / `kiwoom_api.py` / `toss_api.py` / `krx_api.py`: 국내 시세·수급 조회 API 연동 (4중 폴백).
 *   `get_chat_id.py`: 텔레그램 연동 도우미 스크립트.
 *   `requirements.txt`: 의존 패키지 목록.
 *   `.gitignore`: 업로드 방지용 설정 파일.
+
+### 테스트 파일
+
+*   `test_leverage_alerts.py`: TQQQ/QLD 분할매수 티어 계산, 중복 발송 방지, 미국장 개장 판정 검증. **CI 자동 실행.**
+*   `test_report_render.py`: 종목 메타데이터, 숫자 포맷, 15:45 리포트, 인포그래픽 렌더링 검증. **CI 자동 실행.**
+*   `test_sidecar.py`: 사이드카 알림 수동 점검용 (목업 데이터로 실제 텔레그램 발송).
+*   `test_alert.py`: 급락 경보 메시지 서식 수동 점검용 (실제 텔레그램 발송).
+
+> `test_sidecar.py`와 `test_alert.py`는 실제로 텔레그램 메시지를 보내므로 CI에서는 실행하지 않습니다.
