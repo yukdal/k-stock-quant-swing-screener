@@ -19,13 +19,23 @@ def get_access_token():
     Get Access Token from KIS. Uses cached token if valid.
     Tokens are valid for 24 hours.
     """
+    # 캐시된 토큰 확인.
+    # 스케줄러(systemd)와 수동 실행이 동시에 캐시를 쓰면 파일이 깨질 수 있으므로,
+    # 읽기 실패는 예외를 올리지 않고 '캐시 없음'으로 처리해 새 토큰을 재발급한다.
+    # (예외를 올리면 깨진 캐시가 복구되지 않아 KIS 조회가 영구히 실패한다)
     if TOKEN_FILE.exists():
-        with open(TOKEN_FILE, "r") as f:
-            data = json.load(f)
-            # check expiry
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                data = json.load(f)
             if time.time() < data.get("expires_at", 0):
                 return data["access_token"]
-                
+        except Exception as e:
+            print(f"⚠️ KIS 토큰 캐시를 읽을 수 없어 새로 발급합니다: {e}")
+            try:
+                TOKEN_FILE.unlink()
+            except Exception:
+                pass
+
     # Issue new token
     url = f"{KIS_URL_BASE}/oauth2/tokenP"
     headers = {"content-type": "application/json"}
@@ -34,25 +44,46 @@ def get_access_token():
         "appkey": KIS_APP_KEY,
         "appsecret": KIS_APP_SECRET
     }
-    
-    res = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
-    if res.status_code == 200:
-        token_data = res.json()
-        access_token = token_data.get("access_token")
-        expires_in = token_data.get("expires_in", 86400) # usually 86400 sec (24h)
-        
-        # Save to cache
-        cache_data = {
-            "access_token": access_token,
-            "expires_at": time.time() + expires_in - 300 # buffer of 5 mins
-        }
-        with open(TOKEN_FILE, "w") as f:
-            json.dump(cache_data, f)
-            
-        return access_token
-    else:
+
+    try:
+        res = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+    except Exception as e:
+        print(f"❌ KIS 토큰 요청 실패: {e}")
+        return None
+
+    if res.status_code != 200:
         print(f"❌ Failed to get KIS access token: {res.text}")
         return None
+
+    try:
+        token_data = res.json()
+    except Exception as e:
+        print(f"❌ KIS 토큰 응답을 해석할 수 없습니다: {e} / 응답: {res.text[:200]}")
+        return None
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        print(f"❌ KIS 토큰 응답에 access_token이 없습니다: {res.text[:200]}")
+        return None
+
+    expires_in = token_data.get("expires_in", 86400) # usually 86400 sec (24h)
+
+    # Save to cache.
+    # 임시 파일에 쓴 뒤 os.replace로 원자적 교체 → 동시 실행 시에도 파일이 깨지지 않는다.
+    cache_data = {
+        "access_token": access_token,
+        "expires_at": time.time() + expires_in - 300 # buffer of 5 mins
+    }
+    try:
+        tmp_path = TOKEN_FILE.with_suffix(f".{os.getpid()}.tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(cache_data, f)
+        os.replace(tmp_path, TOKEN_FILE)
+    except Exception as e:
+        # 캐시 저장에 실패해도 토큰 자체는 유효하므로 그대로 사용한다
+        print(f"⚠️ KIS 토큰 캐시 저장 실패 (동작에는 영향 없음): {e}")
+
+    return access_token
 
 def fetch_daily_price(ticker):
     """

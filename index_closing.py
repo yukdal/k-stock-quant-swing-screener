@@ -26,6 +26,9 @@ LEVERAGE_ETF_RULES = {
     "QLD":  {"start": 10, "step": 5},
 }
 
+# 전고점(스윙 하이) 탐색에 사용할 국내 지수 일봉 조회 기간 (달력 기준 약 5년)
+KR_HISTORY_DAYS = 1825
+
 US_EASTERN = ZoneInfo("America/New_York")
 US_MARKET_OPEN = datetime.time(9, 30)
 US_MARKET_CLOSE = datetime.time(16, 0)
@@ -142,6 +145,43 @@ def fetch_realtime_index_multi_api(name):
         print(f"❌ Naver Finance Index fallback failed for {name}: {e}")
         return None
 
+def fetch_kr_index_high_series(name, ticker=None):
+    """
+    국내 지수(KOSPI/KOSDAQ)의 전고점 계산용 일봉 고가 시리즈를 반환합니다.
+
+    1순위: KRX(pykrx) — 한국거래소 공식 데이터
+    2순위: yfinance   — KRX 조회 실패 시에만 사용하는 폴백
+
+    두 소스 모두 실패하면 None을 반환하며, 호출부는 전고점 대비를 0%로 처리합니다.
+    """
+    # 1. KRX (한국거래소)
+    try:
+        from krx_api import fetch_krx_index_ohlcv
+        df = fetch_krx_index_ohlcv(name, days=KR_HISTORY_DAYS)
+        if df is not None and len(df) > 0 and "고가" in df.columns:
+            series = df["고가"].dropna()
+            if len(series) > 0:
+                print(f"📗 {name} 전고점 데이터 소스: KRX (pykrx), {len(series)}일치")
+                return series
+    except Exception as e:
+        print(f"⚠️ KRX index history failed for {name}: {e}")
+
+    # 2. yfinance 폴백
+    ticker = ticker or get_index_meta(name)["ticker"]
+    if not ticker:
+        return None
+    try:
+        max_df = yf.Ticker(ticker).history(period="5y").dropna(subset=['High'])
+        if len(max_df) > 0:
+            print(f"📙 {name} 전고점 데이터 소스: yfinance (KRX 조회 실패로 폴백), {len(max_df)}일치")
+            return max_df['High']
+    except Exception as e:
+        print(f"❌ yfinance history fallback failed for {name}: {e}")
+
+    print(f"❌ {name} 전고점 일봉 데이터를 어떤 소스에서도 가져오지 못했습니다.")
+    return None
+
+
 def fetch_index_data(name, ticker=None):
     """
     특정 지수/ETF의 당일(또는 미국 전일) 종가 및 직전 전고점(Swing High) 대비 낙폭을 계산합니다.
@@ -157,20 +197,24 @@ def fetch_index_data(name, ticker=None):
     unit = meta["unit"]
 
     try:
-        idx = yf.Ticker(ticker)
-        max_df = idx.history(period="5y") # 52주 제한 없이 넉넉하게 5년치에서 최근 고점 탐색
         as_of = None
 
         if market == "KR":
+            # 국내 지수는 야후 파이낸스를 쓰지 않는다.
+            #   당일 종가/등락 : KIS → 키움 → 토스 → 네이버 4중 폴백
+            #   전고점 일봉    : KRX(pykrx) → (실패 시에만) 야후 폴백
             realtime_data = fetch_realtime_index_multi_api(name)
             if not realtime_data:
                 raise Exception(f"All APIs failed to fetch {name} real-time data.")
             current_close = realtime_data['current_close']
             point_change = realtime_data['point_change']
             pct_change = realtime_data['pct_change']
+
+            high_series = fetch_kr_index_high_series(name, ticker)
         else:
             # 미국 종목(S&P 500 / NASDAQ 100 / TQQQ / QLD)은 yfinance 종가를 사용한다.
             # KST 15:45 시점에는 미국장이 이미 마감된 상태이므로 '전일(미국 현지) 종가'가 잡힌다.
+            idx = yf.Ticker(ticker)
             recent_df = idx.history(period="5d").dropna(subset=['Close'])
             if len(recent_df) < 2:
                 return None
@@ -183,10 +227,13 @@ def fetch_index_data(name, ticker=None):
             except Exception:
                 as_of = None
 
-        # 최대 기간 데이터로 최근 스윙 하이(전고점) 분석
-        if len(max_df) > 0:
-            max_df = max_df.dropna(subset=['High'])
-            local_high = find_recent_swing_high(max_df['High']) # 52주 제한 없는 진짜 직전 전고점
+            # 52주 제한 없이 넉넉하게 5년치에서 최근 고점 탐색
+            max_df = idx.history(period="5y").dropna(subset=['High'])
+            high_series = max_df['High'] if len(max_df) > 0 else None
+
+        # 최근 스윙 하이(전고점) 분석
+        if high_series is not None and len(high_series) > 0:
+            local_high = find_recent_swing_high(high_series) # 52주 제한 없는 진짜 직전 전고점
 
             local_high_pct = ((current_close - local_high) / local_high * 100) if local_high > 0 else 0.0
         else:
