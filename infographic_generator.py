@@ -207,6 +207,9 @@ def generate_and_send_infographic(indices_data, macro_comment):
         if not group_names:
             continue
 
+        from notifier import send_telegram_message
+
+        # 1. 렌더링 — 실패하면 Playwright/브라우저 문제이므로 그렇게 안내한다
         try:
             cards = [build_card_context(n, indices_data[n]) for n in group_names]
             screenshot_bytes = render_infographic(
@@ -215,18 +218,43 @@ def generate_and_send_infographic(indices_data, macro_comment):
                 subtitle=group["subtitle"].format(date_str=date_str),
                 macro_comment=macro_comment
             )
-
             print(f"📸 Infographic image generated successfully. ({group['key']})")
-
-            success = send_telegram_photo(screenshot_bytes)
-            if not success:
-                raise Exception("텔레그램 이미지 발송 API 호출에 실패했습니다. (터미널 로그를 확인해주세요)")
-
         except Exception as e:
             error_msg = (
-                f"❌ 인포그래픽 이미지({group['key']}) 렌더링 중 오류가 발생했습니다:\n`{str(e)}`\n\n"
+                f"❌ 인포그래픽 이미지({group['key']}) 렌더링에 실패했습니다:\n`{str(e)}`\n\n"
                 "(Playwright/크롬 브라우저 실행 문제일 가능성이 높습니다)"
             )
             print(error_msg)
-            from notifier import send_telegram_message
+            send_telegram_message(error_msg)
+            continue
+
+        # 2. 발송 — 렌더링은 이미 성공했으므로 브라우저 문제로 안내하지 않는다.
+        #    일부 채팅방만 실패한 경우는 나머지가 정상 수신했으므로 알림을 보내지 않고
+        #    로그 경고만 남긴다. (차단된 채팅방 하나 때문에 전원에게 오류가 가던 문제)
+        try:
+            result = send_telegram_photo(screenshot_bytes)
+        except Exception as e:
+            error_msg = f"❌ 인포그래픽 이미지({group['key']}) 발송 중 예외가 발생했습니다:\n`{str(e)}`"
+            print(error_msg)
+            send_telegram_message(error_msg)
+            continue
+
+        if result["removed"]:
+            print(f"🚫 발송 불가로 제거된 채팅방({group['key']}): {result['removed']}")
+
+        if result["sent"]:
+            if result["failed"]:
+                # 부분 실패: 정상 수신한 곳이 있으므로 알림 없이 로그만
+                print(f"⚠️ 일부 채팅방 발송 실패({group['key']}): {result['failed']}")
+            continue
+
+        # 3. 한 곳도 발송하지 못한 경우에만 오류를 알린다.
+        #    남은 채팅방이 아예 없으면 보낼 곳도 없으므로 로그만 남긴다.
+        detail = "; ".join(f"{cid}: {reason}" for cid, reason in result["failed"]) or "발송 대상 채팅방 없음"
+        error_msg = (
+            f"❌ 인포그래픽 이미지({group['key']})를 어떤 채팅방에도 발송하지 못했습니다.\n"
+            f"`{detail}`\n\n(이미지 생성은 정상 완료되었습니다)"
+        )
+        print(error_msg)
+        if result["failed"]:
             send_telegram_message(error_msg)

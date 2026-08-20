@@ -53,3 +53,7 @@ jobs:
       - name: KIS 토큰 캐시 복구 테스트
         # 캐시 파일이 깨졌을 때 재발급으로 자동 복구되는지 검증
         run: python test_kis_token_cache.py
+
+      - name: 텔레그램 이미지 발송 테스트
+        # 차단된 채팅방(403) 처리, file_id 재사용, 부분 실패 시 오탐 알림 방지
+        run: python test_telegram_photo.py
