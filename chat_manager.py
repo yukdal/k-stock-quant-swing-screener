@@ -44,6 +44,21 @@ def add_chat_id(chat_id):
         return True
     return False
 
+def remove_chat_id(chat_id):
+    """
+    채팅방 ID를 목록에서 제거합니다. (봇이 차단·추방되어 영구 발송 불가일 때 사용)
+    제거하면 True, 원래 없었으면 False를 반환합니다.
+    사용자가 다시 받고 싶으면 봇에게 /start를 보내면 재등록됩니다.
+    """
+    chat_ids = load_chat_ids()
+    chat_id_str = str(chat_id)
+    if chat_id_str not in chat_ids:
+        return False
+    chat_ids.remove(chat_id_str)
+    save_chat_ids(chat_ids)
+    print(f"🗑️ 발송 불가 채팅방을 목록에서 제거했습니다: {chat_id_str}")
+    return True
+
 def get_all_chat_ids():
     """
     Get all registered chat IDs.
