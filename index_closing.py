@@ -26,7 +26,7 @@ LEVERAGE_ETF_RULES = {
     "QLD":  {"start": 10, "step": 5},
 }
 
-# 전고점(스윙 하이) 탐색에 사용할 국내 지수 일봉 조회 기간 (달력 기준 약 5년)
+# 전고점(기간 내 최고가) 탐색에 사용할 국내 지수 일봉 조회 기간 (달력 기준 약 5년)
 KR_HISTORY_DAYS = 1825
 
 US_EASTERN = ZoneInfo("America/New_York")
@@ -85,20 +85,49 @@ def is_us_market_open(now_et=None):
     return US_MARKET_OPEN <= now_et.time() <= US_MARKET_CLOSE
 
 
-def find_recent_swing_high(highs_series):
-    """앞뒤 15일(약 3주) 윈도우에서 가장 높은 가격을 '직전 전고점'으로 정의"""
-    prices = highs_series.values
-    n = len(prices)
-    if n < 2:
-        return highs_series.max()
+def find_peak_high(highs_series, current_price=None):
+    """
+    조회 기간(약 5년) 일봉 고가 중 '최고가'를 전고점으로 정의합니다.
 
-    window = 15
-    for i in range(n - 1, -1, -1):
-        start = max(0, i - window)
-        end = min(n, i + window + 1)
-        if prices[i] == max(prices[start:end]):
-            return prices[i]
-    return prices.max()
+    HTS 지수차트에 표시되는 '최고 9,385.59' 같은 값과 동일한 기준이며,
+    전고점 대비 낙폭은 이 최고가를 기준으로 계산해야 실제 하락률과 일치합니다.
+    (이전 방식은 앞뒤 15일 윈도우의 '직전 스윙 하이'를 찾았는데,
+     고점을 찍고 내려온 뒤 소폭 반등하면 그 낮은 봉우리를 전고점으로 잡아
+     낙폭이 실제보다 크게 축소되는 문제가 있었습니다.)
+
+    current_price를 넘기면 신고가를 갱신 중인 날에도 낙폭이 양수가 되지 않도록
+    현재가를 포함해 최고가를 계산합니다.
+    """
+    peak = None
+    if highs_series is not None and len(highs_series) > 0:
+        try:
+            candidate = float(highs_series.max())
+            if candidate == candidate:  # NaN 방지
+                peak = candidate
+        except (TypeError, ValueError):
+            peak = None
+
+    if current_price is not None:
+        try:
+            current_price = float(current_price)
+            peak = current_price if peak is None else max(peak, current_price)
+        except (TypeError, ValueError):
+            pass
+
+    return peak
+
+
+def calc_local_high_pct(current_price, highs_series):
+    """
+    전고점(기간 내 최고가) 대비 낙폭(%)을 반환합니다.
+    - 하락 중이면 음수 (예: 6808.21 / 전고점 9385.59 → -27.46)
+    - 신고가이거나 데이터가 없으면 0.0
+    """
+    peak = find_peak_high(highs_series, current_price)
+    if not peak or peak <= 0 or current_price is None:
+        return 0.0
+    pct = (float(current_price) - peak) / peak * 100
+    return min(pct, 0.0)
 
 def fetch_realtime_index_multi_api(name):
     """
@@ -184,7 +213,7 @@ def fetch_kr_index_high_series(name, ticker=None):
 
 def fetch_index_data(name, ticker=None):
     """
-    특정 지수/ETF의 당일(또는 미국 전일) 종가 및 직전 전고점(Swing High) 대비 낙폭을 계산합니다.
+    특정 지수/ETF의 당일(또는 미국 전일) 종가 및 전고점(기간 내 최고가) 대비 낙폭을 계산합니다.
     ticker를 생략하면 INDICES 메타데이터에서 자동으로 조회합니다.
     """
     meta = get_index_meta(name)
@@ -227,17 +256,12 @@ def fetch_index_data(name, ticker=None):
             except Exception:
                 as_of = None
 
-            # 52주 제한 없이 넉넉하게 5년치에서 최근 고점 탐색
+            # 52주 제한 없이 넉넉하게 5년치에서 최고가 탐색
             max_df = idx.history(period="5y").dropna(subset=['High'])
             high_series = max_df['High'] if len(max_df) > 0 else None
 
-        # 최근 스윙 하이(전고점) 분석
-        if high_series is not None and len(high_series) > 0:
-            local_high = find_recent_swing_high(high_series) # 52주 제한 없는 진짜 직전 전고점
-
-            local_high_pct = ((current_close - local_high) / local_high * 100) if local_high > 0 else 0.0
-        else:
-            local_high_pct = 0.0
+        # 전고점(기간 내 최고가) 대비 낙폭 분석
+        local_high_pct = calc_local_high_pct(current_close, high_series)
 
         return {
             "current_close": current_close,
@@ -256,7 +280,7 @@ def fetch_index_data(name, ticker=None):
 def fetch_us_realtime_quote(name):
     """
     미국 장중 실시간 시세 조회 (yfinance fast_info → 1분봉 폴백).
-    전고점은 fetch_index_data와 동일하게 5년 일봉 스윙하이 기준으로 계산합니다.
+    전고점은 fetch_index_data와 동일하게 5년 일봉 최고가 기준으로 계산합니다.
     """
     meta = get_index_meta(name)
     ticker = meta["ticker"]
@@ -295,11 +319,7 @@ def fetch_us_realtime_quote(name):
         pct_change = (point_change / prev_close * 100) if prev_close else 0.0
 
         max_df = t.history(period="5y").dropna(subset=['High'])
-        if len(max_df) > 0:
-            local_high = find_recent_swing_high(max_df['High'])
-            local_high_pct = ((price - local_high) / local_high * 100) if local_high > 0 else 0.0
-        else:
-            local_high_pct = 0.0
+        local_high_pct = calc_local_high_pct(price, max_df['High'] if len(max_df) > 0 else None)
 
         return {
             "current_close": price,

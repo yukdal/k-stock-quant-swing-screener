@@ -99,8 +99,24 @@ krx_api.fetch_krx_index_ohlcv = lambda market_type, days=None: pd.DataFrame(
 series = ic.fetch_kr_index_high_series("KOSPI", "^KS11")
 check("KRX 성공 시 시리즈 반환", series is not None and len(series) == 3)
 check("KRX 성공 시 yfinance 미호출", len(_yf_calls) == 0, f"호출 {_yf_calls}")
-check("KRX 데이터로 전고점 계산", ic.find_recent_swing_high(series) == 2600.0,
-      str(ic.find_recent_swing_high(series)) if series is not None else "None")
+check("KRX 데이터로 전고점 계산", ic.find_peak_high(series) == 2600.0,
+      str(ic.find_peak_high(series)) if series is not None else "None")
+
+# (1-1) 전고점은 '기간 내 최고가'여야 한다 (직전 스윙 하이가 아님)
+#      HTS 차트 재현: KOSPI 최고 9,385.59 → 현재 6,808.21 = -27.46%
+kospi_highs = pd.Series([2134.77, 9385.59] + [5760.18] * 20 + [7572.88] + [6808.21] * 5)
+check("전고점 = 기간 내 최고가", ic.find_peak_high(kospi_highs) == 9385.59,
+      str(ic.find_peak_high(kospi_highs)))
+check("KOSPI 전고점 대비 낙폭", round(ic.calc_local_high_pct(6808.21, kospi_highs), 2) == -27.46,
+      f"{ic.calc_local_high_pct(6808.21, kospi_highs):.2f}%")
+
+kosdaq_highs = pd.Series([627.01, 1229.42] + [777.61] * 20 + [928.21] + [826.87] * 5)
+check("KOSDAQ 전고점 대비 낙폭", round(ic.calc_local_high_pct(826.87, kosdaq_highs), 2) == -32.74,
+      f"{ic.calc_local_high_pct(826.87, kosdaq_highs):.2f}%")
+
+check("신고가 갱신 시 낙폭 0%", ic.calc_local_high_pct(9999.0, kospi_highs) == 0.0)
+check("전고점 데이터 없으면 0%", ic.calc_local_high_pct(6808.21, None) == 0.0)
+check("빈 시리즈면 0%", ic.calc_local_high_pct(6808.21, pd.Series([], dtype=float)) == 0.0)
 
 # (2) KRX가 실패할 때 → yfinance로 폴백해야 한다
 _yf_calls.clear()
