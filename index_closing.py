@@ -1,8 +1,11 @@
 import datetime
+import json
+import os
+import threading
 from zoneinfo import ZoneInfo
 import yfinance as yf
 from google import genai
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import GEMINI_API_KEY, GEMINI_MODEL, ALERT_STATE_PATH
 from notifier import send_telegram_message
 
 # 종목 메타데이터
@@ -46,7 +49,7 @@ US_MARKET_CLOSE = datetime.time(16, 0)
 # 값은 '이미 알린 최고 단계의 낙폭(%)'이며, 날짜로 초기화하지 않는다.
 # 날짜마다 0으로 되돌리면 하락 구간에 머무는 동안 같은 단계 알림이 매일 반복되므로,
 # 전고점을 회복(낙폭 0%)했을 때만 0으로 되돌려 다음 하락에 다시 울리게 한다.
-# ⚠️ 프로세스를 재시작하면 메모리 상태가 0이 되어 현재 단계 알림이 1회 재발송된다.
+# 아래 상태는 ALERT_STATE_FILE에 저장되어 재시작 후에도 이어진다. (load/save_alert_state)
 CRASH_STATE = {
     "KOSPI": 0,
     "KOSDAQ": 0
@@ -62,6 +65,89 @@ ETF_ALERT_STATE = {
     "TQQQ": 0,
     "QLD": 0,
 }
+
+
+# 알림 상태 저장 파일. 테스트에서는 임시 경로로 교체해 실제 캐시를 건드리지 않는다.
+ALERT_STATE_FILE = ALERT_STATE_PATH
+
+# 스케줄러가 급락/사이드카/ETF 체크를 각각 별도 스레드로 실행하므로,
+# 같은 파일에 동시에 쓰지 않도록 저장 구간을 잠근다.
+_ALERT_STATE_LOCK = threading.Lock()
+
+
+def load_alert_state():
+    """
+    저장된 알림 상태를 읽어 메모리 상태에 반영합니다. (봇 시작 시 1회 호출)
+
+    파일이 없거나 깨져 있어도 예외를 올리지 않고 기본값(모두 0/False)으로 시작합니다.
+    깨진 파일 때문에 알림 자체가 멈추는 것보다, 최악의 경우 알림이 1회 더 나가는 편이 안전합니다.
+    """
+    try:
+        if not os.path.exists(ALERT_STATE_FILE):
+            return
+        with open(ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"⚠️ 알림 상태 파일을 읽을 수 없어 초기값으로 시작합니다: {e}")
+        return
+
+    if not isinstance(data, dict):
+        print("⚠️ 알림 상태 파일 형식이 올바르지 않아 초기값으로 시작합니다.")
+        return
+
+    # 저장된 값 중 '현재 코드가 아는 항목'만 반영한다.
+    # (종목이 추가·제거되어도 남은 키 때문에 깨지지 않도록)
+    for key, saved in (("crash", CRASH_STATE), ("etf", ETF_ALERT_STATE)):
+        section = data.get(key)
+        if not isinstance(section, dict):
+            continue
+        for name in saved:
+            value = section.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                saved[name] = int(value)
+
+    sidecar = data.get("sidecar")
+    if isinstance(sidecar, dict):
+        saved_date = sidecar.get("date")
+        try:
+            # 사이드카는 '당일 1회'가 기준이므로 저장된 날짜가 오늘일 때만 이어받는다.
+            if saved_date and datetime.date.fromisoformat(saved_date) == datetime.date.today():
+                SIDECAR_STATE["date"] = datetime.date.today()
+                for name in ("KOSPI", "KOSDAQ"):
+                    SIDECAR_STATE[name] = bool(sidecar.get(name, False))
+        except (TypeError, ValueError):
+            pass
+
+    print(f"📂 알림 상태 복원: 급락 {dict(CRASH_STATE)} / ETF {dict(ETF_ALERT_STATE)}")
+
+
+def save_alert_state():
+    """
+    현재 알림 상태를 파일에 저장합니다.
+
+    kis_api의 토큰 캐시와 같이 임시 파일에 쓴 뒤 os.replace로 원자적 교체하여,
+    저장 도중 프로세스가 죽어도 파일이 깨지지 않게 합니다.
+    저장에 실패해도 알림 동작 자체는 계속되어야 하므로 예외를 삼킵니다.
+    """
+    sidecar_date = SIDECAR_STATE.get("date")
+    payload = {
+        "crash": dict(CRASH_STATE),
+        "etf": dict(ETF_ALERT_STATE),
+        "sidecar": {
+            "date": sidecar_date.isoformat() if isinstance(sidecar_date, datetime.date) else None,
+            "KOSPI": bool(SIDECAR_STATE.get("KOSPI")),
+            "KOSDAQ": bool(SIDECAR_STATE.get("KOSDAQ")),
+        },
+    }
+
+    with _ALERT_STATE_LOCK:
+        try:
+            tmp_path = f"{ALERT_STATE_FILE}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, ALERT_STATE_FILE)
+        except Exception as e:
+            print(f"⚠️ 알림 상태 저장 실패 (알림 동작에는 영향 없음): {e}")
 
 
 def get_index_meta(name):
@@ -485,6 +571,8 @@ def check_and_send_crash_alerts():
 
     print(f"🔍 [{datetime.datetime.now().strftime('%H:%M:%S')}] Checking Index Crash Alerts...")
 
+    state_changed = False
+
     for name, rule in INDEX_CRASH_RULES.items():
         data = fetch_index_data(name, INDICES[name]["ticker"])
         if not data:
@@ -494,7 +582,9 @@ def check_and_send_crash_alerts():
 
         # 전고점을 회복하면 상태를 초기화해, 다시 하락 돌파할 때 알림이 울리도록 한다.
         if lh_pct >= 0:
-            CRASH_STATE[name] = 0
+            if CRASH_STATE[name] != 0:
+                CRASH_STATE[name] = 0
+                state_changed = True
             continue
 
         drop_pct = abs(lh_pct)
@@ -506,6 +596,7 @@ def check_and_send_crash_alerts():
             continue
 
         CRASH_STATE[name] = level
+        state_changed = True
 
         c_close = f"{data['current_close']:,.2f}"
         pt_chg = format_number(data['point_change'], is_pct=False)
@@ -548,16 +639,22 @@ def check_and_send_crash_alerts():
         send_telegram_message(msg, parse_mode="HTML")
         print(f"🚨 Crash alert sent for {name}: -{level}% ({tier}차)")
 
+    if state_changed:
+        save_alert_state()
+
 def check_and_send_sidecar_alerts():
     """장중 90초 단위로 코스피 ±5%, 코스닥 ±6% 등락 여부를 체크하여 사이드카 자체 감지 알림 발송"""
     global SIDECAR_STATE
     today = datetime.date.today()
-    
-    # 매일 자정 상태 초기화
+
+    state_changed = False
+
+    # 사이드카는 '당일 1회' 기준이므로 날짜가 바뀌면 초기화한다.
     if SIDECAR_STATE["date"] != today:
         SIDECAR_STATE["date"] = today
         SIDECAR_STATE["KOSPI"] = False
         SIDECAR_STATE["KOSDAQ"] = False
+        state_changed = True
 
     print(f"🔍 [{datetime.datetime.now().strftime('%H:%M:%S')}] Checking Sidecar Alerts...")
     
@@ -585,6 +682,10 @@ def check_and_send_sidecar_alerts():
             
             send_telegram_message(msg)
             print(f"🚨 Sidecar alert sent for {name}: {pct_change}%")
+            state_changed = True
+
+    if state_changed:
+        save_alert_state()
 
 def calc_buy_tier(drop_pct, start, step):
     """
@@ -616,6 +717,8 @@ def check_and_send_leverage_etf_alerts():
     now_et = datetime.datetime.now(US_EASTERN)
     print(f"🔍 [{now_et.strftime('%H:%M:%S')} ET] Checking Leverage ETF Buy Alerts...")
 
+    state_changed = False
+
     for name, rule in LEVERAGE_ETF_RULES.items():
         quote = fetch_us_realtime_quote(name)
         if not quote: continue
@@ -624,7 +727,9 @@ def check_and_send_leverage_etf_alerts():
 
         # 전고점 회복 구간이면 상태를 초기화해, 다시 하락 돌파할 때 알림이 울리도록 한다.
         if lh_pct >= 0:
-            ETF_ALERT_STATE[name] = 0
+            if ETF_ALERT_STATE[name] != 0:
+                ETF_ALERT_STATE[name] = 0
+                state_changed = True
             continue
 
         drop_pct = abs(lh_pct)
@@ -636,6 +741,7 @@ def check_and_send_leverage_etf_alerts():
             continue
 
         ETF_ALERT_STATE[name] = level
+        state_changed = True
 
         price_str = format_price(quote['current_close'], quote.get('unit', 'usd'))
         change_str = format_change_block(quote)
@@ -652,6 +758,9 @@ def check_and_send_leverage_etf_alerts():
 
         send_telegram_message(msg, parse_mode="HTML")
         print(f"🚨 Leverage ETF buy alert sent for {name}: -{level}% ({tier}차)")
+
+    if state_changed:
+        save_alert_state()
 
 
 if __name__ == "__main__":

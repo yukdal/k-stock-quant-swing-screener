@@ -9,8 +9,17 @@ import sys
 import datetime
 sys.stdout.reconfigure(encoding='utf-8')
 
+import tempfile
+import os
+import json
+
 import index_closing
 from index_closing import calc_buy_tier, LEVERAGE_ETF_RULES, INDEX_CRASH_RULES, US_EASTERN
+
+# 알림 상태 저장 경로를 임시 파일로 돌려, 테스트가 실제 .cache를 건드리지 않도록 한다.
+# (실제 경로를 쓰면 이전 실행이 남긴 상태를 읽어 테스트 결과가 실행 순서에 좌우된다)
+_state_dir = tempfile.mkdtemp(prefix="alert_state_test_")
+index_closing.ALERT_STATE_FILE = os.path.join(_state_dir, "alert_state.json")
 
 failures = []
 
@@ -165,7 +174,70 @@ check("메시지에 매수 기준 표기", "-20% 1차 진입 후 5% 하락마다
 
 print()
 print("=" * 60)
-print("4. 미국 개장 판정 (서머타임/주말 포함)")
+print("4. 알림 상태 파일 영속화 (재시작 후 중복 발송 방지)")
+print("=" * 60)
+
+# 1차 알림 발송 → 상태가 파일에 기록되어야 한다
+sent.clear()
+index_closing.CRASH_STATE = {"KOSPI": 0, "KOSDAQ": 0}
+index_closing.ETF_ALERT_STATE = {"TQQQ": 0, "QLD": 0}
+index_closing.SIDECAR_STATE = {"date": None, "KOSPI": False, "KOSDAQ": False}
+# 차트 실측값: KOSPI -27.46% (3차, -25%), KOSDAQ -32.74% (3차, -30%)
+index_closing.fetch_index_data = lambda name, ticker=None: {
+    "current_close": 6808.21 if name == "KOSPI" else 826.87,
+    "point_change": -120.5, "pct_change": -1.74,
+    "local_high_pct": -27.46 if name == "KOSPI" else -32.74,
+    "unit": "pt", "market": "KR", "as_of": None,
+}
+index_closing.check_and_send_crash_alerts()
+check("발송 후 상태 파일 생성", os.path.exists(index_closing.ALERT_STATE_FILE), True)
+check("발송 건수", len(sent), 2)
+
+with open(index_closing.ALERT_STATE_FILE, encoding="utf-8") as f:
+    saved = json.load(f)
+check("저장된 KOSPI 단계", saved["crash"]["KOSPI"], 25)
+check("저장된 KOSDAQ 단계", saved["crash"]["KOSDAQ"], 30)
+
+# 재시작 시뮬레이션: 메모리 상태를 날린 뒤 복원하면 같은 단계가 다시 발송되지 않아야 한다
+index_closing.CRASH_STATE = {"KOSPI": 0, "KOSDAQ": 0}
+index_closing.load_alert_state()
+check("복원된 KOSPI 단계", index_closing.CRASH_STATE["KOSPI"], 25)
+
+sent.clear()
+index_closing.check_and_send_crash_alerts()
+check("재시작 후 중복 발송 없음", len(sent), 0)
+
+# 복원 후에도 더 깊은 단계로 내려가면 발송되어야 한다
+sent.clear()
+index_closing.fetch_index_data = lambda name, ticker=None: {
+    "current_close": 6000.0, "point_change": -300.0, "pct_change": -4.5,
+    "local_high_pct": -36.0,  # KOSPI 5차(-35%) / KOSDAQ 4차(-35%)
+    "unit": "pt", "market": "KR", "as_of": None,
+}
+index_closing.check_and_send_crash_alerts()
+check("복원 후 단계 심화는 발송", len(sent), 2)
+
+# 파일이 깨져 있어도 예외 없이 기본값으로 시작해야 한다
+with open(index_closing.ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+    f.write("{ 깨진 JSON")
+index_closing.CRASH_STATE = {"KOSPI": 7, "KOSDAQ": 7}
+try:
+    index_closing.load_alert_state()
+    check("깨진 파일에도 예외 없음", True, True)
+except Exception as exc:
+    check("깨진 파일에도 예외 없음", f"예외 발생: {exc}", True)
+
+# 파일이 아예 없어도 동일하게 안전해야 한다
+os.remove(index_closing.ALERT_STATE_FILE)
+try:
+    index_closing.load_alert_state()
+    check("파일 없어도 예외 없음", True, True)
+except Exception as exc:
+    check("파일 없어도 예외 없음", f"예외 발생: {exc}", True)
+
+print()
+print("=" * 60)
+print("5. 미국 개장 판정 (서머타임/주말 포함)")
 print("=" * 60)
 
 # ET 기준으로 판정되므로 KST 날짜가 토요일이어도 ET 금요일이면 개장

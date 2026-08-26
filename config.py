@@ -31,6 +31,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 CACHE_DIR = BASE_DIR / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
 DART_CORP_MAP_PATH = CACHE_DIR / "dart_corp_code_map.json"
+# 급락 경보 / 분할매수 알림의 발송 이력(도달한 최고 단계).
+# 봇을 재시작해도 같은 단계 알림이 다시 나가지 않도록 파일로 보존합니다.
+ALERT_STATE_PATH = CACHE_DIR / "alert_state.json"
 
 # Logging configuration
 LOG_DIR = BASE_DIR / "logs"
