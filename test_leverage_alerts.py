@@ -1,6 +1,7 @@
 """
-TQQQ/QLD 분할매수 알림 로직 검증 스크립트.
-텔레그램 발송은 목업으로 가로채므로 실제 알림은 나가지 않습니다.
+지수(KOSPI/KOSDAQ) 급락 경보 및 TQQQ/QLD 분할매수 알림 로직 검증 스크립트.
+텔레그램 발송과 시세 조회는 목업으로 가로채므로
+실제 알림이 나가거나 외부 API를 호출하지 않습니다.
 
 실행: python test_leverage_alerts.py
 """
@@ -8,8 +9,17 @@ import sys
 import datetime
 sys.stdout.reconfigure(encoding='utf-8')
 
+import tempfile
+import os
+import json
+
 import index_closing
-from index_closing import calc_etf_buy_tier, LEVERAGE_ETF_RULES, US_EASTERN
+from index_closing import calc_buy_tier, LEVERAGE_ETF_RULES, INDEX_CRASH_RULES, US_EASTERN
+
+# 알림 상태 저장 경로를 임시 파일로 돌려, 테스트가 실제 .cache를 건드리지 않도록 한다.
+# (실제 경로를 쓰면 이전 실행이 남긴 상태를 읽어 테스트 결과가 실행 순서에 좌우된다)
+_state_dir = tempfile.mkdtemp(prefix="alert_state_test_")
+index_closing.ALERT_STATE_FILE = os.path.join(_state_dir, "alert_state.json")
 
 failures = []
 
@@ -26,19 +36,36 @@ print("1. 매수 단계(티어) 계산 검증")
 print("=" * 60)
 
 # TQQQ: -10% 1차, 이후 1%마다
-check("TQQQ  -9.9%", calc_etf_buy_tier(9.9, 10, 1), (0, 0))
-check("TQQQ -10.0%", calc_etf_buy_tier(10.0, 10, 1), (1, 10))
-check("TQQQ -10.9%", calc_etf_buy_tier(10.9, 10, 1), (1, 10))
-check("TQQQ -11.0%", calc_etf_buy_tier(11.0, 10, 1), (2, 11))
-check("TQQQ -12.4%", calc_etf_buy_tier(12.4, 10, 1), (3, 12))
-check("TQQQ -30.0%", calc_etf_buy_tier(30.0, 10, 1), (21, 30))
+check("TQQQ  -9.9%", calc_buy_tier(9.9, 10, 1), (0, 0))
+check("TQQQ -10.0%", calc_buy_tier(10.0, 10, 1), (1, 10))
+check("TQQQ -10.9%", calc_buy_tier(10.9, 10, 1), (1, 10))
+check("TQQQ -11.0%", calc_buy_tier(11.0, 10, 1), (2, 11))
+check("TQQQ -12.4%", calc_buy_tier(12.4, 10, 1), (3, 12))
+check("TQQQ -30.0%", calc_buy_tier(30.0, 10, 1), (21, 30))
 
 # QLD: -10% 1차, 이후 5%마다
-check("QLD  -10.0%", calc_etf_buy_tier(10.0, 10, 5), (1, 10))
-check("QLD  -14.9%", calc_etf_buy_tier(14.9, 10, 5), (1, 10))
-check("QLD  -15.0%", calc_etf_buy_tier(15.0, 10, 5), (2, 15))
-check("QLD  -20.3%", calc_etf_buy_tier(20.3, 10, 5), (3, 20))
-check("QLD  -50.0%", calc_etf_buy_tier(50.0, 10, 5), (9, 50))
+check("QLD  -10.0%", calc_buy_tier(10.0, 10, 5), (1, 10))
+check("QLD  -14.9%", calc_buy_tier(14.9, 10, 5), (1, 10))
+check("QLD  -15.0%", calc_buy_tier(15.0, 10, 5), (2, 15))
+check("QLD  -20.3%", calc_buy_tier(20.3, 10, 5), (3, 20))
+check("QLD  -50.0%", calc_buy_tier(50.0, 10, 5), (9, 50))
+
+# KOSPI: -15% 1차, 이후 5%마다 / KOSDAQ: -20% 1차, 이후 5%마다
+check("KOSPI  -14.9%", calc_buy_tier(14.9, 15, 5), (0, 0))
+check("KOSPI  -15.0%", calc_buy_tier(15.0, 15, 5), (1, 15))
+check("KOSPI  -19.9%", calc_buy_tier(19.9, 15, 5), (1, 15))
+check("KOSPI  -20.0%", calc_buy_tier(20.0, 15, 5), (2, 20))
+check("KOSPI  -27.46% (차트 실측)", calc_buy_tier(27.46, 15, 5), (3, 25))
+
+check("KOSDAQ -19.9%", calc_buy_tier(19.9, 20, 5), (0, 0))
+check("KOSDAQ -20.0%", calc_buy_tier(20.0, 20, 5), (1, 20))
+check("KOSDAQ -32.74% (차트 실측)", calc_buy_tier(32.74, 20, 5), (3, 30))
+
+# 설정된 규칙이 의도한 값인지 고정
+check("KOSPI 규칙", INDEX_CRASH_RULES["KOSPI"], {"start": 15, "step": 5})
+check("KOSDAQ 규칙", INDEX_CRASH_RULES["KOSDAQ"], {"start": 20, "step": 5})
+check("TQQQ 규칙 (현행 유지)", LEVERAGE_ETF_RULES["TQQQ"], {"start": 10, "step": 1})
+check("QLD 규칙 (현행 유지)", LEVERAGE_ETF_RULES["QLD"], {"start": 10, "step": 5})
 
 print()
 print("=" * 60)
@@ -63,7 +90,7 @@ expected_alerts = {
 
 for etf_name, drops in scenario.items():
     sent.clear()
-    index_closing.ETF_ALERT_STATE = {"session": None, "TQQQ": 0, "QLD": 0}
+    index_closing.ETF_ALERT_STATE = {"TQQQ": 0, "QLD": 0}
 
     rules_backup = dict(LEVERAGE_ETF_RULES)
     for other in list(LEVERAGE_ETF_RULES):
@@ -93,7 +120,124 @@ for etf_name, drops in scenario.items():
 
 print()
 print("=" * 60)
-print("3. 미국 개장 판정 (서머타임/주말 포함)")
+print("3. 지수 급락 경보: 단계 심화 시에만 발송 (매일 반복 없음)")
+print("=" * 60)
+
+# check_and_send_crash_alerts()는 함수 내부에서 `from kis_api import get_etf_current_price`를
+# 수행하므로, index_closing이 아닌 kis_api 모듈 속성을 교체해야 목업이 적용된다.
+# (교체하지 않으면 테스트가 실제 증권사 API를 호출해 느려지고 네트워크에 의존하게 된다)
+import kis_api
+kis_api.get_etf_current_price = lambda code: {"price": 12345, "change_rate": -2.34}
+
+# 낙폭 시나리오: 기준미달 → 1차 → 같은 단계 재확인(다음날 포함) → 심화 → 얕아짐 → 재하락 → 전고점 회복 → 재하락
+index_scenario = {
+    # KOSPI(-15% 1차, 5%마다): 1차진입(-15) / 단계심화(-25) / 회복 후 재하락(-15) → 3건
+    "KOSPI":  ([-12.0, -15.3, -15.9, -18.0, -27.46, -21.0, -25.5, 0.0, -16.0], 3),
+    # KOSDAQ(-20% 1차, 5%마다): 1차진입(-20) / 단계심화(-30) / 회복 후 재하락(-20) → 3건
+    "KOSDAQ": ([-18.0, -20.5, -21.9, -24.0, -32.74, -26.0, -30.5, 0.0, -22.0], 3),
+}
+labels = ["기준미달", "1차진입", "동일단계", "동일단계", "단계심화", "얕아짐", "동일단계재확인", "전고점회복", "재하락"]
+
+for idx_name, (drops, expected) in index_scenario.items():
+    sent.clear()
+    index_closing.CRASH_STATE = {"KOSPI": 0, "KOSDAQ": 0}
+
+    rules_backup = dict(INDEX_CRASH_RULES)
+    for other in list(INDEX_CRASH_RULES):
+        if other != idx_name:
+            INDEX_CRASH_RULES.pop(other)
+
+    print(f"\n▶ {idx_name} 시나리오")
+    for label, lh_pct in zip(labels, drops):
+        index_closing.fetch_index_data = lambda name, ticker=None, v=lh_pct: {
+            "current_close": 6808.21,
+            "point_change": -120.5,
+            "pct_change": -1.74,
+            "local_high_pct": v,
+            "unit": "pt",
+            "market": "KR",
+            "as_of": None,
+        }
+        before = len(sent)
+        index_closing.check_and_send_crash_alerts()
+        fired = len(sent) - before
+        print(f"   {label:14s} 낙폭 {lh_pct:+7.2f}% → 알림 {fired}건 (누적 상태 {index_closing.CRASH_STATE[idx_name]})")
+
+    check(f"{idx_name} 총 발송 건수", len(sent), expected)
+
+    INDEX_CRASH_RULES.clear()
+    INDEX_CRASH_RULES.update(rules_backup)
+
+# 발송된 메시지에 단계와 기준이 표기되는지 확인
+check("메시지에 매수 단계 표기", "[3차 매수 추천]" in sent[1] if len(sent) > 1 else False, True)
+check("메시지에 매수 기준 표기", "-20% 1차 진입 후 5% 하락마다" in sent[1] if len(sent) > 1 else False, True)
+
+print()
+print("=" * 60)
+print("4. 알림 상태 파일 영속화 (재시작 후 중복 발송 방지)")
+print("=" * 60)
+
+# 1차 알림 발송 → 상태가 파일에 기록되어야 한다
+sent.clear()
+index_closing.CRASH_STATE = {"KOSPI": 0, "KOSDAQ": 0}
+index_closing.ETF_ALERT_STATE = {"TQQQ": 0, "QLD": 0}
+index_closing.SIDECAR_STATE = {"date": None, "KOSPI": False, "KOSDAQ": False}
+# 차트 실측값: KOSPI -27.46% (3차, -25%), KOSDAQ -32.74% (3차, -30%)
+index_closing.fetch_index_data = lambda name, ticker=None: {
+    "current_close": 6808.21 if name == "KOSPI" else 826.87,
+    "point_change": -120.5, "pct_change": -1.74,
+    "local_high_pct": -27.46 if name == "KOSPI" else -32.74,
+    "unit": "pt", "market": "KR", "as_of": None,
+}
+index_closing.check_and_send_crash_alerts()
+check("발송 후 상태 파일 생성", os.path.exists(index_closing.ALERT_STATE_FILE), True)
+check("발송 건수", len(sent), 2)
+
+with open(index_closing.ALERT_STATE_FILE, encoding="utf-8") as f:
+    saved = json.load(f)
+check("저장된 KOSPI 단계", saved["crash"]["KOSPI"], 25)
+check("저장된 KOSDAQ 단계", saved["crash"]["KOSDAQ"], 30)
+
+# 재시작 시뮬레이션: 메모리 상태를 날린 뒤 복원하면 같은 단계가 다시 발송되지 않아야 한다
+index_closing.CRASH_STATE = {"KOSPI": 0, "KOSDAQ": 0}
+index_closing.load_alert_state()
+check("복원된 KOSPI 단계", index_closing.CRASH_STATE["KOSPI"], 25)
+
+sent.clear()
+index_closing.check_and_send_crash_alerts()
+check("재시작 후 중복 발송 없음", len(sent), 0)
+
+# 복원 후에도 더 깊은 단계로 내려가면 발송되어야 한다
+sent.clear()
+index_closing.fetch_index_data = lambda name, ticker=None: {
+    "current_close": 6000.0, "point_change": -300.0, "pct_change": -4.5,
+    "local_high_pct": -36.0,  # KOSPI 5차(-35%) / KOSDAQ 4차(-35%)
+    "unit": "pt", "market": "KR", "as_of": None,
+}
+index_closing.check_and_send_crash_alerts()
+check("복원 후 단계 심화는 발송", len(sent), 2)
+
+# 파일이 깨져 있어도 예외 없이 기본값으로 시작해야 한다
+with open(index_closing.ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+    f.write("{ 깨진 JSON")
+index_closing.CRASH_STATE = {"KOSPI": 7, "KOSDAQ": 7}
+try:
+    index_closing.load_alert_state()
+    check("깨진 파일에도 예외 없음", True, True)
+except Exception as exc:
+    check("깨진 파일에도 예외 없음", f"예외 발생: {exc}", True)
+
+# 파일이 아예 없어도 동일하게 안전해야 한다
+os.remove(index_closing.ALERT_STATE_FILE)
+try:
+    index_closing.load_alert_state()
+    check("파일 없어도 예외 없음", True, True)
+except Exception as exc:
+    check("파일 없어도 예외 없음", f"예외 발생: {exc}", True)
+
+print()
+print("=" * 60)
+print("5. 미국 개장 판정 (서머타임/주말 포함)")
 print("=" * 60)
 
 # ET 기준으로 판정되므로 KST 날짜가 토요일이어도 ET 금요일이면 개장

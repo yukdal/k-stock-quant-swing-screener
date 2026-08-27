@@ -1,8 +1,11 @@
 import datetime
+import json
+import os
+import threading
 from zoneinfo import ZoneInfo
 import yfinance as yf
 from google import genai
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import GEMINI_API_KEY, GEMINI_MODEL, ALERT_STATE_PATH
 from notifier import send_telegram_message
 
 # 종목 메타데이터
@@ -26,6 +29,15 @@ LEVERAGE_ETF_RULES = {
     "QLD":  {"start": 10, "step": 5},
 }
 
+# 국내 지수 급락 경보 / 분할매수 알림 기준 (전고점 대비 낙폭 %)
+#   KOSPI  : -15%에서 1차 매수, 이후 5%마다 (-20% 2차, -25% 3차 ...)
+#   KOSDAQ : -20%에서 1차 매수, 이후 5%마다 (-25% 2차, -30% 3차 ...)
+# 코스닥은 코스피보다 낙폭이 통상 1.3~1.5배 크므로 진입 시작점을 더 높게 잡는다.
+INDEX_CRASH_RULES = {
+    "KOSPI":  {"start": 15, "step": 5},
+    "KOSDAQ": {"start": 20, "step": 5},
+}
+
 # 전고점(기간 내 최고가) 탐색에 사용할 국내 지수 일봉 조회 기간 (달력 기준 약 5년)
 KR_HISTORY_DAYS = 1825
 
@@ -33,8 +45,12 @@ US_EASTERN = ZoneInfo("America/New_York")
 US_MARKET_OPEN = datetime.time(9, 30)
 US_MARKET_CLOSE = datetime.time(16, 0)
 
+# 급락 경보 / 레버리지 ETF 알림 상태.
+# 값은 '이미 알린 최고 단계의 낙폭(%)'이며, 날짜로 초기화하지 않는다.
+# 날짜마다 0으로 되돌리면 하락 구간에 머무는 동안 같은 단계 알림이 매일 반복되므로,
+# 전고점을 회복(낙폭 0%)했을 때만 0으로 되돌려 다음 하락에 다시 울리게 한다.
+# 아래 상태는 ALERT_STATE_FILE에 저장되어 재시작 후에도 이어진다. (load/save_alert_state)
 CRASH_STATE = {
-    "date": None,
     "KOSPI": 0,
     "KOSDAQ": 0
 }
@@ -45,13 +61,93 @@ SIDECAR_STATE = {
     "KOSDAQ": False
 }
 
-# 레버리지 ETF 알림 상태. 미국장은 KST 자정을 넘겨 이어지므로
-# KST 날짜가 아닌 '미국 동부(ET) 날짜' 기준으로 초기화해야 장 도중 리셋되지 않는다.
 ETF_ALERT_STATE = {
-    "session": None,
     "TQQQ": 0,
     "QLD": 0,
 }
+
+
+# 알림 상태 저장 파일. 테스트에서는 임시 경로로 교체해 실제 캐시를 건드리지 않는다.
+ALERT_STATE_FILE = ALERT_STATE_PATH
+
+# 스케줄러가 급락/사이드카/ETF 체크를 각각 별도 스레드로 실행하므로,
+# 같은 파일에 동시에 쓰지 않도록 저장 구간을 잠근다.
+_ALERT_STATE_LOCK = threading.Lock()
+
+
+def load_alert_state():
+    """
+    저장된 알림 상태를 읽어 메모리 상태에 반영합니다. (봇 시작 시 1회 호출)
+
+    파일이 없거나 깨져 있어도 예외를 올리지 않고 기본값(모두 0/False)으로 시작합니다.
+    깨진 파일 때문에 알림 자체가 멈추는 것보다, 최악의 경우 알림이 1회 더 나가는 편이 안전합니다.
+    """
+    try:
+        if not os.path.exists(ALERT_STATE_FILE):
+            return
+        with open(ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"⚠️ 알림 상태 파일을 읽을 수 없어 초기값으로 시작합니다: {e}")
+        return
+
+    if not isinstance(data, dict):
+        print("⚠️ 알림 상태 파일 형식이 올바르지 않아 초기값으로 시작합니다.")
+        return
+
+    # 저장된 값 중 '현재 코드가 아는 항목'만 반영한다.
+    # (종목이 추가·제거되어도 남은 키 때문에 깨지지 않도록)
+    for key, saved in (("crash", CRASH_STATE), ("etf", ETF_ALERT_STATE)):
+        section = data.get(key)
+        if not isinstance(section, dict):
+            continue
+        for name in saved:
+            value = section.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                saved[name] = int(value)
+
+    sidecar = data.get("sidecar")
+    if isinstance(sidecar, dict):
+        saved_date = sidecar.get("date")
+        try:
+            # 사이드카는 '당일 1회'가 기준이므로 저장된 날짜가 오늘일 때만 이어받는다.
+            if saved_date and datetime.date.fromisoformat(saved_date) == datetime.date.today():
+                SIDECAR_STATE["date"] = datetime.date.today()
+                for name in ("KOSPI", "KOSDAQ"):
+                    SIDECAR_STATE[name] = bool(sidecar.get(name, False))
+        except (TypeError, ValueError):
+            pass
+
+    print(f"📂 알림 상태 복원: 급락 {dict(CRASH_STATE)} / ETF {dict(ETF_ALERT_STATE)}")
+
+
+def save_alert_state():
+    """
+    현재 알림 상태를 파일에 저장합니다.
+
+    kis_api의 토큰 캐시와 같이 임시 파일에 쓴 뒤 os.replace로 원자적 교체하여,
+    저장 도중 프로세스가 죽어도 파일이 깨지지 않게 합니다.
+    저장에 실패해도 알림 동작 자체는 계속되어야 하므로 예외를 삼킵니다.
+    """
+    sidecar_date = SIDECAR_STATE.get("date")
+    payload = {
+        "crash": dict(CRASH_STATE),
+        "etf": dict(ETF_ALERT_STATE),
+        "sidecar": {
+            "date": sidecar_date.isoformat() if isinstance(sidecar_date, datetime.date) else None,
+            "KOSPI": bool(SIDECAR_STATE.get("KOSPI")),
+            "KOSDAQ": bool(SIDECAR_STATE.get("KOSDAQ")),
+        },
+    }
+
+    with _ALERT_STATE_LOCK:
+        try:
+            tmp_path = f"{ALERT_STATE_FILE}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, ALERT_STATE_FILE)
+        except Exception as e:
+            print(f"⚠️ 알림 상태 저장 실패 (알림 동작에는 영향 없음): {e}")
 
 
 def get_index_meta(name):
@@ -66,11 +162,6 @@ def get_index_meta(name):
         "flag": "",
         "slug": name.lower().replace("&", "").replace(" ", ""),
     }
-
-
-def get_us_session_date():
-    """미국 동부시간 기준 오늘 날짜 (거래 세션 식별자)"""
-    return datetime.datetime.now(US_EASTERN).date()
 
 
 def is_us_market_open(now_et=None):
@@ -472,102 +563,98 @@ def execute_index_closing(*args, **kwargs):
         print(f"❌ Error occurred during index settlement execution: {e}")
 
 def check_and_send_crash_alerts():
-    """장중 30분 단위로 급락 여부를 체크하여 알림 발송"""
+    """
+    장중 15분 단위로 KOSPI/KOSDAQ의 전고점 대비 낙폭을 체크하여
+    분할매수 단계 진입 시 알림을 발송합니다. (기준: INDEX_CRASH_RULES)
+    """
     global CRASH_STATE
-    today = datetime.date.today()
-    
-    # 매일 자정 상태 초기화
-    if CRASH_STATE["date"] != today:
-        CRASH_STATE["date"] = today
-        CRASH_STATE["KOSPI"] = 0
-        CRASH_STATE["KOSDAQ"] = 0
 
     print(f"🔍 [{datetime.datetime.now().strftime('%H:%M:%S')}] Checking Index Crash Alerts...")
-    
-    for name in ["KOSPI", "KOSDAQ"]:
+
+    state_changed = False
+
+    for name, rule in INDEX_CRASH_RULES.items():
         data = fetch_index_data(name, INDICES[name]["ticker"])
-        if not data: continue
+        if not data:
+            continue
 
         lh_pct = data["local_high_pct"]
-        if lh_pct > 0: continue # 상승 구간이면 무시
-        
+
+        # 전고점을 회복하면 상태를 초기화해, 다시 하락 돌파할 때 알림이 울리도록 한다.
+        if lh_pct >= 0:
+            if CRASH_STATE[name] != 0:
+                CRASH_STATE[name] = 0
+                state_changed = True
+            continue
+
         drop_pct = abs(lh_pct)
-        threshold = int(drop_pct // 5) * 5
-        
-        current_prev_state = CRASH_STATE[name]
-        
-        # 당일 상승(회복) 시에도 상태를 업데이트하여, 다시 하락 돌파할 때 알림이 울릴 수 있도록 함
-        CRASH_STATE[name] = threshold
-        
-        min_threshold = 10 if name == "KOSPI" else 20
-        
-        if threshold >= min_threshold and threshold > current_prev_state:
-            current_10_level = int(drop_pct // 10) * 10
-            prev_10_level = int(current_prev_state // 10) * 10
-            
-            is_buy_signal = (current_10_level >= 30 and current_10_level > prev_10_level)
-            
-            c_close = f"{data['current_close']:,.2f}"
-            pt_chg = format_number(data['point_change'], is_pct=False)
-            pct_chg = format_number(data['pct_change'], is_pct=True)
-            
-            from kis_api import get_etf_current_price
-            
-            etfs = []
-            if name == "KOSPI":
-                etfs = [
-                    ("KODEX 200", "069500"),
-                    ("KODEX 레버리지", "122630")
-                ]
-            elif name == "KOSDAQ":
-                etfs = [
-                    ("KODEX 코스닥150", "229200"),
-                    ("KODEX 코스닥150레버리지", "233740")
-                ]
-                
-            etf_messages = []
-            for etf_name, etf_code in etfs:
-                etf_data = get_etf_current_price(etf_code)
-                if etf_data:
-                    price_str = f"{etf_data['price']:,}"
-                    chg = etf_data['change_rate']
-                    sign = "+" if chg > 0 else ""
-                    etf_messages.append(f"{etf_name} ({etf_code}): {price_str}원 ({sign}{chg:.2f}%)")
-                else:
-                    etf_messages.append(f"{etf_name} ({etf_code}): 데이터 응답 지연")
-            
-            actual_drop_pct = f"{data['local_high_pct']:.2f}"
-            
-            if is_buy_signal:
-                buy_tier = (current_10_level - 20) // 10
-                msg = f"🚨 시장 급락 경보 {name} 직전 고점 대비 -{current_10_level}% 돌파! 🚨\n\n"
-                msg += f"현재 지수가 최근 전고점 대비 심각한 하락 구간에 진입하여 <b>[{buy_tier}차 매수 추천]</b> 알림을 발송합니다.\n"
-                msg += f"■ 현재 {name} 지수: {c_close} ({pt_chg}pt, {pct_chg})\n"
-                msg += f"<b>■ 전고점 대비 하락률: {actual_drop_pct}%</b>\n\n"
-                msg += "투심 악화 및 반대매매 물량 출회 가능성에 유의하시되, 룰 베이스 분할 매수 전략에 의거해 대응하시길 바랍니다.\n\n"
+        tier, level = calc_buy_tier(drop_pct, rule["start"], rule["step"])
+
+        # 기준 미달이거나 이미 알린 단계 이하이면 조용히 넘어간다.
+        # (낙폭이 얕아져도 상태를 낮추지 않으므로 같은 단계가 반복 발송되지 않는다)
+        if tier <= 0 or level <= CRASH_STATE[name]:
+            continue
+
+        CRASH_STATE[name] = level
+        state_changed = True
+
+        c_close = f"{data['current_close']:,.2f}"
+        pt_chg = format_number(data['point_change'], is_pct=False)
+        pct_chg = format_number(data['pct_change'], is_pct=True)
+        actual_drop_pct = f"{lh_pct:.2f}"
+
+        from kis_api import get_etf_current_price
+
+        if name == "KOSPI":
+            etfs = [
+                ("KODEX 200", "069500"),
+                ("KODEX 레버리지", "122630")
+            ]
+        else:
+            etfs = [
+                ("KODEX 코스닥150", "229200"),
+                ("KODEX 코스닥150레버리지", "233740")
+            ]
+
+        etf_messages = []
+        for etf_name, etf_code in etfs:
+            etf_data = get_etf_current_price(etf_code)
+            if etf_data:
+                price_str = f"{etf_data['price']:,}"
+                chg = etf_data['change_rate']
+                sign = "+" if chg > 0 else ""
+                etf_messages.append(f"{etf_name} ({etf_code}): {price_str}원 ({sign}{chg:.2f}%)")
             else:
-                msg = f"🚨 시장 급락 경보 {name} 직전 고점 대비 -{threshold}% 돌파! 🚨\n\n"
-                msg += "현재 지수가 최근 전고점 대비 심각한 하락 구간에 진입했습니다.\n"
-                msg += f"■ 현재 {name} 지수: {c_close} ({pt_chg}pt, {pct_chg})\n"
-                msg += f"<b>■ 전고점 대비 하락률: {actual_drop_pct}%</b>\n\n"
-                msg += "투심 악화 및 반대매매 물량 출회 가능성에 유의하시어 철저한 리스크 관리를 권장합니다.\n\n"
-            
-            msg += "💡 연동 상품 실시간 현재가:\n\n"
-            msg += "\n\n".join(etf_messages)
-            
-            send_telegram_message(msg, parse_mode="HTML")
-            print(f"🚨 Crash alert sent for {name}: -{threshold}%")
+                etf_messages.append(f"{etf_name} ({etf_code}): 데이터 응답 지연")
+
+        msg = f"🚨 시장 급락 경보 {name} 전고점 대비 -{level}% 돌파! <b>[{tier}차 매수 추천]</b> 🚨\n\n"
+        msg += f"현재 지수가 전고점 대비 하락 구간에 진입했습니다.\n"
+        msg += f"■ 현재 {name} 지수: {c_close} ({pt_chg}pt, {pct_chg})\n"
+        msg += f"<b>■ 전고점 대비 하락률: {actual_drop_pct}%</b>\n\n"
+        msg += f"※ 매수 기준: -{rule['start']}% 1차 진입 후 {rule['step']}% 하락마다 추가 매수\n"
+        msg += "투심 악화 및 반대매매 물량 출회 가능성에 유의하시되, 룰 베이스 분할 매수 전략에 의거해 대응하시길 바랍니다.\n\n"
+        msg += "💡 연동 상품 실시간 현재가:\n\n"
+        msg += "\n\n".join(etf_messages)
+
+        send_telegram_message(msg, parse_mode="HTML")
+        print(f"🚨 Crash alert sent for {name}: -{level}% ({tier}차)")
+
+    if state_changed:
+        save_alert_state()
 
 def check_and_send_sidecar_alerts():
     """장중 90초 단위로 코스피 ±5%, 코스닥 ±6% 등락 여부를 체크하여 사이드카 자체 감지 알림 발송"""
     global SIDECAR_STATE
     today = datetime.date.today()
-    
-    # 매일 자정 상태 초기화
+
+    state_changed = False
+
+    # 사이드카는 '당일 1회' 기준이므로 날짜가 바뀌면 초기화한다.
     if SIDECAR_STATE["date"] != today:
         SIDECAR_STATE["date"] = today
         SIDECAR_STATE["KOSPI"] = False
         SIDECAR_STATE["KOSDAQ"] = False
+        state_changed = True
 
     print(f"🔍 [{datetime.datetime.now().strftime('%H:%M:%S')}] Checking Sidecar Alerts...")
     
@@ -595,14 +682,20 @@ def check_and_send_sidecar_alerts():
             
             send_telegram_message(msg)
             print(f"🚨 Sidecar alert sent for {name}: {pct_change}%")
+            state_changed = True
 
-def calc_etf_buy_tier(drop_pct, start, step):
+    if state_changed:
+        save_alert_state()
+
+def calc_buy_tier(drop_pct, start, step):
     """
     전고점 대비 낙폭(양수 %)에 해당하는 분할매수 단계와 기준 낙폭을 반환합니다.
+    국내 지수(INDEX_CRASH_RULES)와 레버리지 ETF(LEVERAGE_ETF_RULES)가 함께 사용합니다.
     기준 미달이면 (0, 0).
 
-    예) TQQQ(start=10, step=1): 10.0% → (1차, 10), 11.5% → (2차, 11), 12.0% → (3차, 12)
-        QLD (start=10, step=5): 10.0% → (1차, 10), 15.2% → (2차, 15), 20.0% → (3차, 20)
+    예) TQQQ (start=10, step=1): 10.0% → (1차, 10), 11.5% → (2차, 11), 12.0% → (3차, 12)
+        QLD  (start=10, step=5): 10.0% → (1차, 10), 15.2% → (2차, 15), 20.0% → (3차, 20)
+        KOSPI(start=15, step=5): 14.9% → (0, 0),   15.0% → (1차, 15), 27.5% → (3차, 25)
     """
     if drop_pct < start:
         return 0, 0
@@ -614,21 +707,17 @@ def calc_etf_buy_tier(drop_pct, start, step):
 def check_and_send_leverage_etf_alerts():
     """
     미국 정규장 중 30분 단위로 TQQQ/QLD의 전고점 대비 낙폭을 체크하여
-    분할매수 단계 진입 시 알림을 발송합니다.
+    분할매수 단계 진입 시 알림을 발송합니다. (기준: LEVERAGE_ETF_RULES)
     """
     global ETF_ALERT_STATE
 
     if not is_us_market_open():
         return
 
-    session = get_us_session_date()
-    if ETF_ALERT_STATE["session"] != session:
-        ETF_ALERT_STATE["session"] = session
-        for etf_name in LEVERAGE_ETF_RULES:
-            ETF_ALERT_STATE[etf_name] = 0
-
     now_et = datetime.datetime.now(US_EASTERN)
     print(f"🔍 [{now_et.strftime('%H:%M:%S')} ET] Checking Leverage ETF Buy Alerts...")
+
+    state_changed = False
 
     for name, rule in LEVERAGE_ETF_RULES.items():
         quote = fetch_us_realtime_quote(name)
@@ -638,17 +727,21 @@ def check_and_send_leverage_etf_alerts():
 
         # 전고점 회복 구간이면 상태를 초기화해, 다시 하락 돌파할 때 알림이 울리도록 한다.
         if lh_pct >= 0:
-            ETF_ALERT_STATE[name] = 0
+            if ETF_ALERT_STATE[name] != 0:
+                ETF_ALERT_STATE[name] = 0
+                state_changed = True
             continue
 
         drop_pct = abs(lh_pct)
-        tier, level = calc_etf_buy_tier(drop_pct, rule["start"], rule["step"])
+        tier, level = calc_buy_tier(drop_pct, rule["start"], rule["step"])
 
-        prev_level = ETF_ALERT_STATE[name]
-        ETF_ALERT_STATE[name] = level
-
-        if tier <= 0 or level <= prev_level:
+        # 기준 미달이거나 이미 알린 단계 이하이면 조용히 넘어간다.
+        # (낙폭이 얕아져도 상태를 낮추지 않으므로 같은 단계가 반복 발송되지 않는다)
+        if tier <= 0 or level <= ETF_ALERT_STATE[name]:
             continue
+
+        ETF_ALERT_STATE[name] = level
+        state_changed = True
 
         price_str = format_price(quote['current_close'], quote.get('unit', 'usd'))
         change_str = format_change_block(quote)
@@ -656,7 +749,7 @@ def check_and_send_leverage_etf_alerts():
         kst_time = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime('%m/%d %H:%M')
 
         msg = f"🚨 {name} 전고점 대비 -{level}% 돌파! <b>[{tier}차 매수 추천]</b> 🚨\n\n"
-        msg += f"나스닥100 레버리지 ETF {name}가 직전 전고점 대비 하락 구간에 진입했습니다.\n"
+        msg += f"나스닥100 레버리지 ETF {name}가 전고점 대비 하락 구간에 진입했습니다.\n"
         msg += f"■ 현재가: {price_str} ({change_str})\n"
         msg += f"<b>■ 전고점 대비 하락률: {actual_drop}%</b>\n"
         msg += f"■ 감지 시각: {kst_time} KST (미국 정규장 중)\n\n"
@@ -665,6 +758,9 @@ def check_and_send_leverage_etf_alerts():
 
         send_telegram_message(msg, parse_mode="HTML")
         print(f"🚨 Leverage ETF buy alert sent for {name}: -{level}% ({tier}차)")
+
+    if state_changed:
+        save_alert_state()
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from index_closing import (
     check_and_send_sidecar_alerts,
     check_and_send_leverage_etf_alerts,
     is_us_market_open,
+    load_alert_state,
 )
 import psutil
 
@@ -266,6 +267,10 @@ def main():
     # Schedule mode
     # 중복 실행 방지 락 획득 (OCI 및 로컬 겸용)
     acquire_process_lock()
+
+    # 이전 실행에서 어느 단계까지 알렸는지 복원한다.
+    # 복원하지 않으면 재시작할 때마다 현재 낙폭 단계 알림이 다시 발송된다.
+    load_alert_state()
     
     is_local_env = (os.name == 'nt')
     
